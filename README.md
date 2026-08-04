@@ -8,6 +8,7 @@ IPMT 是一个用 Rust、Ratatui 和 Crossterm 编写的 pi `models.json` 终端
 - 快速新增、编辑、复制、删除，提供 OpenAI、Ollama、LM Studio、Anthropic 和 Google 模板
 - 编辑推理、图像输入、上下文、输出上限、成本、thinking map、headers 和 compat
 - 从 OpenAI、Anthropic、Google 风格的模型目录发现并批量导入模型
+- 自动获取 `sub2api` 最新模型数据，支持按模型 ID 搜索，并带上下文、推理、视觉、价格和思考级别映射快速导入
 - 撤销/重做、删除确认、未保存退出保护和磁盘并发修改检测
 - 保存前执行 schema 与语义校验，未知 JSON 字段和成本阶梯不会因普通表单编辑而丢失
 - 原子保存、时间戳备份，并在 Unix 上将配置与备份权限设为 `0600`
@@ -70,6 +71,7 @@ ipmt [OPTIONS]
 | `d`、`Delete` | 删除当前项 |
 | `c` | 复制当前项并生成唯一 ID |
 | `f` | 从当前提供商发现模型 |
+| `i`（模型栏） | 搜索已知模型并按能力参数快速导入 |
 | `s`、`Ctrl+S` | 校验并保存 |
 | `Ctrl+Z` / `Ctrl+Y` | 撤销 / 重做 |
 | `v` | 查看校验结果 |
@@ -90,6 +92,8 @@ ipmt [OPTIONS]
 - `google-generative-ai`: `<baseUrl>/models`
 
 认证解析顺序与 pi 一致：`auth.json`、已知提供商环境变量、`models.json` 中的 `apiKey`。支持 `$VAR`、`${VAR}`、`$$` 和 `$!`；为了避免编辑器隐式执行任意代码，发现功能不会执行 `!command` 类型的值。
+
+已知模型快速导入使用 `sub2api` 的 `model_prices_and_context_window.json`。上游的每 token 价格会转换为 pi 使用的每百万 token 价格；推理能力标记会转换为 `reasoning` 和 `thinkingLevelMap`。同时支持 `max` 与 `xhigh` 时，Claude 模型映射为 `{"xhigh":"max"}`，GPT 和其他模型映射为 `{"xhigh":"xhigh"}`。
 
 ## 保存策略
 

@@ -16,6 +16,7 @@ use crate::editor::{
     FormAction, FormState, FormSubmission, PROVIDER_TEMPLATES, ProviderTemplateInfo,
     provider_template,
 };
+use crate::known_models::{KnownModel, fetch_known_models};
 
 const HISTORY_LIMIT: usize = 100;
 
@@ -55,6 +56,12 @@ pub struct VisibleModel {
 pub struct DiscoveryChoice {
     pub model: DiscoveredModel,
     pub selected: bool,
+    pub exists: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct KnownModelChoice {
+    pub model: KnownModel,
     pub exists: bool,
 }
 
@@ -108,11 +115,28 @@ pub enum Overlay {
         scroll: usize,
         focus: DialogFocus,
     },
+    KnownModelsLoading {
+        provider_id: String,
+    },
+    KnownModelsPicker {
+        provider_id: String,
+        choices: Vec<KnownModelChoice>,
+        filtered: Vec<usize>,
+        query: String,
+        cursor: usize,
+        scroll: usize,
+        focus: DialogFocus,
+    },
 }
 
 struct DiscoveryResult {
     provider_id: String,
     result: Result<Vec<DiscoveredModel>, String>,
+}
+
+struct KnownModelsResult {
+    provider_id: String,
+    result: Result<Vec<KnownModel>, String>,
 }
 
 pub struct App {
@@ -131,6 +155,7 @@ pub struct App {
     undo: Vec<Value>,
     redo: Vec<Value>,
     discovery_rx: Option<Receiver<DiscoveryResult>>,
+    known_models_rx: Option<Receiver<KnownModelsResult>>,
     last_list_click: Option<(Pane, usize, Instant)>,
 }
 
@@ -169,6 +194,7 @@ impl App {
             undo: Vec::new(),
             redo: Vec::new(),
             discovery_rx: None,
+            known_models_rx: None,
             last_list_click: None,
         };
         app.normalize_selection();
@@ -295,6 +321,7 @@ impl App {
     }
 
     pub fn poll_background(&mut self) {
+        self.poll_known_models();
         let result = match self.discovery_rx.as_ref().map(Receiver::try_recv) {
             Some(Ok(result)) => Some(result),
             Some(Err(TryRecvError::Disconnected)) => {
@@ -477,6 +504,7 @@ impl App {
             },
             KeyCode::Char('p') => self.open_templates(),
             KeyCode::Char('m') => self.new_model(),
+            KeyCode::Char('i') if self.focus == Pane::Models => self.start_known_models(),
             KeyCode::Char('d') | KeyCode::Delete => self.confirm_delete(),
             KeyCode::Char('c') => self.duplicate_selected(),
             KeyCode::Char('f') => self.start_discovery(),
@@ -773,6 +801,95 @@ impl App {
                     });
                 }
             }
+            Overlay::KnownModelsLoading { provider_id } => {
+                if key.code == KeyCode::Esc {
+                    self.known_models_rx = None;
+                    self.set_status(StatusKind::Warning, "已忽略已知模型目录结果");
+                } else {
+                    self.overlay = Some(Overlay::KnownModelsLoading { provider_id });
+                }
+            }
+            Overlay::KnownModelsPicker {
+                provider_id,
+                choices,
+                mut filtered,
+                mut query,
+                mut cursor,
+                mut scroll,
+                mut focus,
+            } => {
+                let mut keep_open = true;
+                match focus {
+                    DialogFocus::Content => match key.code {
+                        KeyCode::Esc => keep_open = false,
+                        KeyCode::Tab | KeyCode::BackTab => focus = DialogFocus::Actions(0),
+                        KeyCode::Up => cursor = cursor.saturating_sub(1),
+                        KeyCode::Down => {
+                            cursor = (cursor + 1).min(filtered.len().saturating_sub(1))
+                        }
+                        KeyCode::PageUp => cursor = cursor.saturating_sub(10),
+                        KeyCode::PageDown => {
+                            cursor = (cursor + 10).min(filtered.len().saturating_sub(1))
+                        }
+                        KeyCode::Home => cursor = 0,
+                        KeyCode::End => cursor = filtered.len().saturating_sub(1),
+                        KeyCode::Enter => {
+                            if let Some(choice) =
+                                filtered.get(cursor).and_then(|index| choices.get(*index))
+                            {
+                                self.import_known_model(&provider_id, choice);
+                                return;
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            query.pop();
+                            filtered = filter_known_models(&choices, &query);
+                            cursor = 0;
+                            scroll = 0;
+                        }
+                        KeyCode::Char(character)
+                            if !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                        {
+                            query.push(character);
+                            filtered = filter_known_models(&choices, &query);
+                            cursor = 0;
+                            scroll = 0;
+                        }
+                        _ => {}
+                    },
+                    DialogFocus::Actions(_) => match key.code {
+                        KeyCode::Esc => keep_open = false,
+                        KeyCode::Tab | KeyCode::BackTab | KeyCode::Up => {
+                            focus = DialogFocus::Content
+                        }
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            if let Some(choice) =
+                                filtered.get(cursor).and_then(|index| choices.get(*index))
+                            {
+                                self.import_known_model(&provider_id, choice);
+                                return;
+                            }
+                        }
+                        _ => {}
+                    },
+                }
+                if cursor < scroll {
+                    scroll = cursor;
+                }
+                if keep_open {
+                    self.overlay = Some(Overlay::KnownModelsPicker {
+                        provider_id,
+                        choices,
+                        filtered,
+                        query,
+                        cursor,
+                        scroll,
+                        focus,
+                    });
+                }
+            }
         }
     }
 
@@ -890,6 +1007,103 @@ impl App {
             None,
             &json!({"contextWindow": 128000, "maxTokens": 16384}),
         )));
+    }
+
+    fn start_known_models(&mut self) {
+        if !self.ensure_writable() {
+            return;
+        }
+        let Some(provider) = self.selected_provider() else {
+            self.set_status(StatusKind::Warning, "请先选择提供商");
+            return;
+        };
+        let provider_id = provider.summary.id;
+        let result_provider_id = provider_id.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = fetch_known_models().map_err(|error| error.to_string());
+            let _ = sender.send(KnownModelsResult {
+                provider_id: result_provider_id,
+                result,
+            });
+        });
+        self.known_models_rx = Some(receiver);
+        self.overlay = Some(Overlay::KnownModelsLoading { provider_id });
+        self.set_status(StatusKind::Info, "正在获取最新已知模型数据...");
+    }
+
+    fn poll_known_models(&mut self) {
+        let result = match self.known_models_rx.as_ref().map(Receiver::try_recv) {
+            Some(Ok(result)) => Some(result),
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.known_models_rx = None;
+                if matches!(self.overlay, Some(Overlay::KnownModelsLoading { .. })) {
+                    self.overlay = None;
+                    self.set_status(StatusKind::Error, "已知模型目录任务意外结束");
+                }
+                None
+            }
+            Some(Err(TryRecvError::Empty)) | None => None,
+        };
+        let Some(result) = result else { return };
+        self.known_models_rx = None;
+        match result.result {
+            Ok(models) => {
+                let existing: std::collections::HashSet<_> = self
+                    .doc
+                    .models(&result.provider_id)
+                    .into_iter()
+                    .map(|model| model.id)
+                    .collect();
+                let choices = models
+                    .into_iter()
+                    .map(|model| KnownModelChoice {
+                        exists: existing.contains(&model.id),
+                        model,
+                    })
+                    .collect::<Vec<_>>();
+                let filtered = (0..choices.len()).collect();
+                let count = choices.len();
+                self.overlay = Some(Overlay::KnownModelsPicker {
+                    provider_id: result.provider_id,
+                    choices,
+                    filtered,
+                    query: String::new(),
+                    cursor: 0,
+                    scroll: 0,
+                    focus: DialogFocus::Content,
+                });
+                self.set_status(StatusKind::Success, format!("已载入 {count} 个已知模型"));
+            }
+            Err(error) => {
+                self.overlay = None;
+                self.set_status(StatusKind::Error, error);
+            }
+        }
+    }
+
+    fn import_known_model(&mut self, provider_id: &str, choice: &KnownModelChoice) {
+        if choice.exists {
+            self.set_status(
+                StatusKind::Warning,
+                format!("模型 {} 已存在", choice.model.id),
+            );
+            return;
+        }
+        let previous = self.doc.root().clone();
+        if let Some(index) = self.doc.push_model(provider_id, choice.model.value.clone()) {
+            self.record_snapshot(previous);
+            self.search.clear();
+            self.select_provider_id(provider_id);
+            self.select_model_source_index(index);
+            self.focus = Pane::Models;
+            self.set_status(
+                StatusKind::Success,
+                format!("已按已知参数导入 {}", choice.model.id),
+            );
+        } else {
+            self.set_status(StatusKind::Error, "提供商 models 字段不是数组");
+        }
     }
 
     fn apply_form(&mut self, form: &FormState) -> Result<(), String> {
@@ -1096,7 +1310,20 @@ impl App {
         let provider_id = request.provider_id().to_owned();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let result = discover_models(&request).map_err(|error| error.to_string());
+            let result = discover_models(&request)
+                .map(|mut models| {
+                    if let Ok(known) = fetch_known_models() {
+                        let known = known
+                            .into_iter()
+                            .map(|model| (model.id.clone(), model.value))
+                            .collect::<std::collections::HashMap<_, _>>();
+                        for model in &mut models {
+                            model.config = known.get(&model.id).cloned();
+                        }
+                    }
+                    models
+                })
+                .map_err(|error| error.to_string());
             let _ = sender.send(DiscoveryResult {
                 provider_id,
                 result,
@@ -1125,7 +1352,11 @@ impl App {
         let mut imported = 0;
         let mut last_index = None;
         for choice in selected {
-            let mut model = json!({ "id": choice.model.id });
+            let mut model = choice
+                .model
+                .config
+                .clone()
+                .unwrap_or_else(|| json!({ "id": choice.model.id }));
             if let Some(name) = &choice.model.name
                 && name != &choice.model.id
             {
@@ -1401,6 +1632,31 @@ fn model_search_text(model: &ModelSummary) -> Vec<String> {
     values
 }
 
+fn filter_known_models(choices: &[KnownModelChoice], query: &str) -> Vec<usize> {
+    if query.trim().is_empty() {
+        return (0..choices.len()).collect();
+    }
+    let matcher = SkimMatcherV2::default().ignore_case();
+    let mut matched = choices
+        .iter()
+        .enumerate()
+        .filter_map(|(index, choice)| {
+            [
+                Some(choice.model.id.as_str()),
+                choice.model.name.as_deref(),
+                Some(choice.model.family.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(|text| matcher.fuzzy_match(text, query.trim()))
+            .max()
+            .map(|score| (Reverse(score), index))
+        })
+        .collect::<Vec<_>>();
+    matched.sort_by_key(|item| *item);
+    matched.into_iter().map(|(_, index)| index).collect()
+}
+
 fn move_index(current: usize, amount: isize, max: usize) -> usize {
     if amount.is_negative() {
         current.saturating_sub(amount.unsigned_abs())
@@ -1562,6 +1818,7 @@ mod tests {
                 model: DiscoveredModel {
                     id: "new-model".into(),
                     name: None,
+                    config: None,
                 },
                 selected: false,
                 exists: false,

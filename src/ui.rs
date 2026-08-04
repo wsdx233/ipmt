@@ -499,6 +499,28 @@ fn overlay_mouse_action(app: &App, event: MouseEvent, terminal: Rect) -> Option<
                 }
             }
         }
+        Overlay::KnownModelsLoading { .. } => {
+            let area = modal_rect(terminal, 58, 9, 84, 54);
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Right))
+                || matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                    && !area.contains(point)
+            {
+                return Some(MouseAction::Key(KeyCode::Esc, KeyModifiers::NONE));
+            }
+        }
+        Overlay::KnownModelsPicker { .. } => {
+            let area = modal_rect(terminal, 92, 30, 94, 90);
+            if let Some(amount) = scroll
+                && area.contains(point)
+            {
+                return Some(MouseAction::ScrollOverlay(amount));
+            }
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                && !area.contains(point)
+            {
+                return Some(MouseAction::Key(KeyCode::Esc, KeyModifiers::NONE));
+            }
+        }
     }
     None
 }
@@ -623,6 +645,19 @@ fn scroll_overlay(app: &mut App, amount: isize) {
             ..
         }) => {
             *cursor = move_index(*cursor, amount, choices.len().saturating_sub(1));
+            *focus = DialogFocus::Content;
+            if *cursor < *scroll {
+                *scroll = *cursor;
+            }
+        }
+        Some(Overlay::KnownModelsPicker {
+            filtered,
+            cursor,
+            scroll,
+            focus,
+            ..
+        }) => {
+            *cursor = move_index(*cursor, amount, filtered.len().saturating_sub(1));
             *focus = DialogFocus::Content;
             if *cursor < *scroll {
                 *scroll = *cursor;
@@ -1210,6 +1245,12 @@ fn command_specs(width: u16, app: &App) -> Vec<CommandSpec> {
                 color: MUTED,
             },
             CommandSpec {
+                label: " i 已知模型 ",
+                code: KeyCode::Char('i'),
+                modifiers: normal,
+                color: BLUE,
+            },
+            CommandSpec {
                 label: " s 保存 ",
                 code: KeyCode::Char('s'),
                 modifiers: normal,
@@ -1375,6 +1416,28 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App, overlay: &Overlay, terminal: R
             *scroll,
             *focus,
         ),
+        Overlay::KnownModelsLoading { provider_id } => {
+            draw_known_models_loading(frame, terminal, provider_id)
+        }
+        Overlay::KnownModelsPicker {
+            provider_id,
+            choices,
+            filtered,
+            query,
+            cursor,
+            scroll,
+            focus,
+        } => draw_known_models_picker(
+            frame,
+            terminal,
+            provider_id,
+            choices,
+            filtered,
+            query,
+            *cursor,
+            *scroll,
+            *focus,
+        ),
     }
 }
 
@@ -1404,6 +1467,7 @@ fn draw_help(frame: &mut Frame<'_>, terminal: Rect, scroll: usize) {
         help_row("r", "重新载入磁盘文件"),
         help_row("v", "查看全部校验结果"),
         help_row("f", "从当前提供商发现远程模型"),
+        help_row("i（模型栏）", "搜索在线已知模型并按能力参数导入"),
         Line::default(),
         help_heading("弹窗焦点"),
         help_row("Tab / Shift+Tab", "直接切换内容区与按钮区"),
@@ -1964,6 +2028,158 @@ fn draw_discovery_picker(
             DialogFocus::Actions(button) => Some(button),
         },
     );
+}
+
+fn draw_known_models_loading(frame: &mut Frame<'_>, terminal: Rect, provider_id: &str) {
+    let area = modal_rect(terminal, 58, 9, 84, 54);
+    let block = modal_block(" 已知模型目录 ");
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let tick = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        / 180;
+    let spinner = ["|", "/", "-", "\\"][tick as usize % 4];
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(format!("{spinner}  "), Style::default().fg(CYAN)),
+                Span::styled(provider_id.to_owned(), Style::default().fg(TEXT)),
+            ]),
+            Line::default(),
+            Line::styled(
+                "正在从 sub2api 获取最新模型能力与价格...",
+                Style::default().fg(MUTED),
+            ),
+            Line::styled("Esc 忽略结果", Style::default().fg(MUTED)),
+        ])
+        .alignment(Alignment::Center)
+        .block(Block::default().padding(Padding::vertical(1)))
+        .style(Style::default().bg(PANEL)),
+        inner,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_known_models_picker(
+    frame: &mut Frame<'_>,
+    terminal: Rect,
+    provider_id: &str,
+    choices: &[crate::app::KnownModelChoice],
+    filtered: &[usize],
+    query: &str,
+    cursor: usize,
+    scroll: usize,
+    focus: DialogFocus,
+) {
+    let area = modal_rect(terminal, 92, 30, 94, 90);
+    let title = format!(
+        " 已知模型快速导入  {provider_id}  /  {}/{} ",
+        filtered.len(),
+        choices.len()
+    );
+    let block = modal_block(&title);
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("搜索模型 ID  ", Style::default().fg(CYAN)),
+            Span::styled(
+                if query.is_empty() {
+                    "直接输入..."
+                } else {
+                    query
+                },
+                Style::default().fg(if query.is_empty() { MUTED } else { TEXT }),
+            ),
+        ]))
+        .style(Style::default().bg(SURFACE)),
+        rows[0],
+    );
+    let visible = rows[1].height as usize;
+    let effective_scroll = discovery_view_offset(filtered.len(), visible, cursor, scroll);
+    let end = (effective_scroll + visible).min(filtered.len());
+    let items = filtered[effective_scroll..end]
+        .iter()
+        .filter_map(|index| choices.get(*index))
+        .map(|choice| {
+            let value = choice.model.value.as_object();
+            let reasoning = value
+                .and_then(|v| v.get("reasoning"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let vision = value
+                .and_then(|v| v.get("input"))
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("image")));
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if choice.exists { "[=]" } else { "[+]" },
+                    Style::default().fg(if choice.exists { MUTED } else { GREEN }),
+                ),
+                Span::styled(
+                    format!(
+                        " {}{}  ",
+                        if reasoning { "R" } else { "-" },
+                        if vision { "V" } else { "-" }
+                    ),
+                    Style::default().fg(MAGENTA),
+                ),
+                Span::styled(choice.model.id.clone(), Style::default().fg(TEXT)),
+                Span::styled(
+                    format!("  {}", choice.model.family),
+                    Style::default().fg(MUTED),
+                ),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default()
+        .with_selected((!items.is_empty()).then_some(cursor.saturating_sub(effective_scroll)));
+    frame.render_stateful_widget(
+        List::new(items).highlight_symbol("> ").highlight_style(
+            Style::default()
+                .fg(if focus == DialogFocus::Content {
+                    CYAN
+                } else {
+                    MUTED
+                })
+                .bg(SURFACE),
+        ),
+        rows[1],
+        &mut state,
+    );
+    draw_scrollbar(frame, rows[1], filtered.len(), cursor);
+    draw_action_bar(
+        frame,
+        rows[2],
+        &[ActionButton {
+            label: "导入",
+            color: GREEN,
+        }],
+        match focus {
+            DialogFocus::Content => None,
+            DialogFocus::Actions(_) => Some(0),
+        },
+    );
+    if focus == DialogFocus::Content {
+        let x = rows[0]
+            .x
+            .saturating_add(15)
+            .saturating_add(query.width() as u16)
+            .min(rows[0].right().saturating_sub(1));
+        frame.set_cursor_position(Position::new(x, rows[0].y));
+    }
 }
 
 fn panel_block(title: &str, focused: bool) -> Block<'_> {

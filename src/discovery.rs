@@ -15,6 +15,7 @@ const MAX_CATALOG_BYTES: usize = 10 * 1024 * 1024;
 pub struct DiscoveredModel {
     pub id: String,
     pub name: Option<String>,
+    pub config: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -406,7 +407,11 @@ fn parse_catalog(payload: &Value) -> Result<Vec<DiscoveredModel>, DiscoveryError
             continue;
         };
         if !id.trim().is_empty() && seen.insert(id.clone()) {
-            models.push(DiscoveredModel { id, name });
+            models.push(DiscoveredModel {
+                id,
+                name,
+                config: None,
+            });
         }
     }
     if models.is_empty() {
@@ -571,7 +576,8 @@ mod tests {
             models,
             vec![DiscoveredModel {
                 id: "remote-model".into(),
-                name: None
+                name: None,
+                config: None,
             }]
         );
     }
