@@ -2366,7 +2366,16 @@ fn number_or_zero(value: Option<&Value>) -> String {
             if number.fract() == 0.0 {
                 format!("{number:.0}")
             } else {
-                format!("{number}")
+                let formatted = format!("{number:.12}");
+                let trimmed = formatted
+                    .trim_end_matches('0')
+                    .trim_end_matches('.')
+                    .to_owned();
+                if matches!(trimmed.as_str(), "0" | "-0") && number != 0.0 {
+                    number.to_string()
+                } else {
+                    trimmed
+                }
             }
         })
         .unwrap_or_else(|| "0".into())

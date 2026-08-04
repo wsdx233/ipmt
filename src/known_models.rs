@@ -281,7 +281,9 @@ fn copy_price(
         return;
     };
     // sub2api 使用每 token 价格，pi 的 cost 字段使用每百万 token 价格。
-    if let Some(number) = Number::from_f64(per_token * 1_000_000.0) {
+    // 乘法可能产生 0.19999999999999998 一类浮点尾差，价格保留 12 位小数即可。
+    let per_million = (per_token * 1_000_000.0 * 1_000_000_000_000.0).round() / 1_000_000_000_000.0;
+    if let Some(number) = Number::from_f64(per_million) {
         target.insert(target_key.into(), Value::Number(number));
     }
 }
@@ -330,7 +332,7 @@ mod tests {
                 "supports_max_reasoning_effort": true,
                 "input_cost_per_token": 0.000003,
                 "output_cost_per_token": 0.000015,
-                "cache_read_input_token_cost": 0.0000003,
+                "cache_read_input_token_cost": 0.0000002,
                 "cache_creation_input_token_cost": 0.00000375
             }
         }))
@@ -342,7 +344,7 @@ mod tests {
         assert_eq!(models[0].value["thinkingLevelMap"], json!({"xhigh":"max"}));
         assert_eq!(models[0].value["cost"]["input"], 3.0);
         assert_eq!(models[0].value["cost"]["output"], 15.0);
-        assert_eq!(models[0].value["cost"]["cacheRead"], 0.3);
+        assert_eq!(models[0].value["cost"]["cacheRead"], 0.2);
         assert_eq!(models[0].value["cost"]["cacheWrite"], 3.75);
     }
 

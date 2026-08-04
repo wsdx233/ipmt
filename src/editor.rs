@@ -352,28 +352,28 @@ impl FormState {
                 field(
                     FieldId::CostInput,
                     "输入价格",
-                    object_number(cost, "input"),
+                    object_decimal(cost, "input"),
                     FieldKind::Decimal,
                     "每百万 token；留空为 0",
                 ),
                 field(
                     FieldId::CostOutput,
                     "输出价格",
-                    object_number(cost, "output"),
+                    object_decimal(cost, "output"),
                     FieldKind::Decimal,
                     "每百万 token；留空为 0",
                 ),
                 field(
                     FieldId::CostCacheRead,
                     "缓存读取价格",
-                    object_number(cost, "cacheRead"),
+                    object_decimal(cost, "cacheRead"),
                     FieldKind::Decimal,
                     "每百万 token；留空为 0",
                 ),
                 field(
                     FieldId::CostCacheWrite,
                     "缓存写入价格",
-                    object_number(cost, "cacheWrite"),
+                    object_decimal(cost, "cacheWrite"),
                     FieldKind::Decimal,
                     "每百万 token；留空为 0",
                 ),
@@ -1000,6 +1000,27 @@ fn object_number(object: Option<&Map<String, Value>>, key: &str) -> String {
         .unwrap_or_default()
 }
 
+fn object_decimal(object: Option<&Map<String, Value>>, key: &str) -> String {
+    object
+        .and_then(|object| object.get(key))
+        .and_then(Value::as_f64)
+        .map(format_decimal)
+        .unwrap_or_default()
+}
+
+fn format_decimal(number: f64) -> String {
+    let formatted = format!("{number:.12}");
+    let trimmed = formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned();
+    if matches!(trimmed.as_str(), "0" | "-0") && number != 0.0 {
+        number.to_string()
+    } else {
+        trimmed
+    }
+}
+
 fn object_json(object: Option<&Map<String, Value>>, key: &str) -> String {
     object
         .and_then(|object| object.get(key))
@@ -1070,6 +1091,16 @@ mod tests {
         };
         assert_eq!(value["cost"]["input"], 1.5);
         assert!(value["cost"]["tiers"].is_array());
+    }
+
+    #[test]
+    fn model_form_hides_floating_point_noise_in_prices() {
+        let existing = json!({
+            "id": "m",
+            "cost": {"input": 0.19999999999999998}
+        });
+        let form = FormState::model("p".into(), Some(0), &existing);
+        assert_eq!(form.field(FieldId::CostInput).value, "0.2");
     }
 
     #[test]
