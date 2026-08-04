@@ -34,6 +34,20 @@ curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/wsdx233/
 curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/wsdx233/ipmt/master/install.sh | IPMT_INSTALL_DIR="$HOME/bin" sh
 ```
 
+### Windows 一键安装
+
+在 PowerShell 中复制并执行下面这条命令，即可从最新 GitHub Release 自动下载、校验并安装 Windows x86_64 版本：
+
+```powershell
+irm https://raw.githubusercontent.com/wsdx233/ipmt/master/install.ps1 | iex
+```
+
+默认安装到 `%LOCALAPPDATA%\Programs\ipmt\bin`，脚本会自动将该目录加入当前用户的 `PATH`。重新打开终端后可直接运行 `ipmt`。也可通过 `IPMT_INSTALL_DIR` 指定安装目录：
+
+```powershell
+$env:IPMT_INSTALL_DIR = "$HOME\bin"; irm https://raw.githubusercontent.com/wsdx233/ipmt/master/install.ps1 | iex
+```
+
 从源码安装：
 
 ```bash
@@ -134,3 +148,7 @@ cargo run -- --check
 ```
 
 项目针对 pi 当前支持的四种 `models.json` API 类型进行校验：`openai-completions`、`openai-responses`、`anthropic-messages` 和 `google-generative-ai`。
+
+## 致谢
+
+感谢 Linux.do 社区提供的分享与交流平台
