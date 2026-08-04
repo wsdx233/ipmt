@@ -111,6 +111,9 @@ pub enum Overlay {
     DiscoveryPicker {
         provider_id: String,
         choices: Vec<DiscoveryChoice>,
+        filtered: Vec<usize>,
+        query: String,
+        filter_active: bool,
         cursor: usize,
         scroll: usize,
         focus: DialogFocus,
@@ -361,6 +364,9 @@ impl App {
                 self.overlay = Some(Overlay::DiscoveryPicker {
                     provider_id: result.provider_id,
                     choices,
+                    filtered: (0..count).collect(),
+                    query: String::new(),
+                    filter_active: false,
                     cursor: 0,
                     scroll: 0,
                     focus: DialogFocus::Content,
@@ -450,6 +456,20 @@ impl App {
             Event::Paste(text) => {
                 if let Some(Overlay::Form(form)) = self.overlay.as_mut() {
                     form.insert_paste(&text);
+                } else if let Some(Overlay::DiscoveryPicker {
+                    choices,
+                    filtered,
+                    query,
+                    filter_active: true,
+                    cursor,
+                    scroll,
+                    ..
+                }) = self.overlay.as_mut()
+                {
+                    query.push_str(&text.replace(['\r', '\n'], " "));
+                    *filtered = filter_discovered_models(choices, query);
+                    *cursor = 0;
+                    *scroll = 0;
                 } else if self.search_active {
                     self.search.push_str(&text.replace(['\r', '\n'], " "));
                     self.normalize_selection();
@@ -706,87 +726,126 @@ impl App {
             Overlay::DiscoveryPicker {
                 provider_id,
                 mut choices,
+                mut filtered,
+                mut query,
+                mut filter_active,
                 mut cursor,
                 mut scroll,
                 mut focus,
             } => {
                 let mut keep_open = true;
-                match focus {
-                    DialogFocus::Content => match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => keep_open = false,
-                        KeyCode::Tab => focus = DialogFocus::Actions(0),
-                        KeyCode::BackTab => focus = DialogFocus::Actions(3),
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            cursor = cursor.saturating_sub(1);
+                if filter_active {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Enter => filter_active = false,
+                        KeyCode::Backspace => {
+                            query.pop();
+                            filtered = filter_discovered_models(&choices, &query);
+                            cursor = 0;
+                            scroll = 0;
                         }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            if cursor + 1 < choices.len() {
-                                cursor += 1;
-                            } else {
-                                focus = DialogFocus::Actions(0);
-                            }
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            query.clear();
+                            filtered = filter_discovered_models(&choices, &query);
+                            cursor = 0;
+                            scroll = 0;
                         }
-                        KeyCode::PageUp => cursor = cursor.saturating_sub(10),
-                        KeyCode::PageDown => {
-                            cursor = (cursor + 10).min(choices.len().saturating_sub(1));
-                        }
-                        KeyCode::Home | KeyCode::Char('g') => cursor = 0,
-                        KeyCode::End | KeyCode::Char('G') => {
-                            cursor = choices.len().saturating_sub(1);
-                        }
-                        KeyCode::Char(' ') => {
-                            if let Some(choice) = choices.get_mut(cursor)
-                                && !choice.exists
-                            {
-                                choice.selected = !choice.selected;
-                            }
-                        }
-                        KeyCode::Char('a') => {
-                            for choice in &mut choices {
-                                choice.selected = !choice.exists;
-                            }
-                        }
-                        KeyCode::Char('x') => {
-                            for choice in &mut choices {
-                                choice.selected = false;
-                            }
+                        KeyCode::Char(character)
+                            if !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                        {
+                            query.push(character);
+                            filtered = filter_discovered_models(&choices, &query);
+                            cursor = 0;
+                            scroll = 0;
                         }
                         _ => {}
-                    },
-                    DialogFocus::Actions(mut button) => match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => keep_open = false,
-                        KeyCode::Tab | KeyCode::BackTab | KeyCode::Up => {
-                            focus = DialogFocus::Content;
-                        }
-                        KeyCode::Left => {
-                            button = button.saturating_sub(1);
-                            focus = DialogFocus::Actions(button);
-                        }
-                        KeyCode::Right => {
-                            button = (button + 1).min(3);
-                            focus = DialogFocus::Actions(button);
-                        }
-                        KeyCode::Home => focus = DialogFocus::Actions(0),
-                        KeyCode::End => focus = DialogFocus::Actions(3),
-                        KeyCode::Enter | KeyCode::Char(' ') => match button {
-                            0 => {
-                                self.import_discovered(&provider_id, &choices);
-                                return;
+                    }
+                } else {
+                    match focus {
+                        DialogFocus::Content => match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => keep_open = false,
+                            KeyCode::Char('/') => filter_active = true,
+                            KeyCode::Tab => focus = DialogFocus::Actions(0),
+                            KeyCode::BackTab => focus = DialogFocus::Actions(3),
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                cursor = cursor.saturating_sub(1);
                             }
-                            1 => {
-                                for choice in &mut choices {
-                                    choice.selected = !choice.exists;
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if cursor + 1 < filtered.len() {
+                                    cursor += 1;
+                                } else {
+                                    focus = DialogFocus::Actions(0);
                                 }
                             }
-                            2 => {
-                                for choice in &mut choices {
-                                    choice.selected = false;
+                            KeyCode::PageUp => cursor = cursor.saturating_sub(10),
+                            KeyCode::PageDown => {
+                                cursor = (cursor + 10).min(filtered.len().saturating_sub(1));
+                            }
+                            KeyCode::Home | KeyCode::Char('g') => cursor = 0,
+                            KeyCode::End | KeyCode::Char('G') => {
+                                cursor = filtered.len().saturating_sub(1);
+                            }
+                            KeyCode::Char(' ') => {
+                                if let Some(choice) = filtered
+                                    .get(cursor)
+                                    .and_then(|index| choices.get_mut(*index))
+                                    && !choice.exists
+                                {
+                                    choice.selected = !choice.selected;
                                 }
                             }
-                            _ => keep_open = false,
+                            KeyCode::Char('a') => {
+                                for index in &filtered {
+                                    if let Some(choice) = choices.get_mut(*index) {
+                                        choice.selected = !choice.exists;
+                                    }
+                                }
+                            }
+                            KeyCode::Char('x') => {
+                                for index in &filtered {
+                                    if let Some(choice) = choices.get_mut(*index) {
+                                        choice.selected = false;
+                                    }
+                                }
+                            }
+                            _ => {}
                         },
-                        _ => {}
-                    },
+                        DialogFocus::Actions(mut button) => match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => keep_open = false,
+                            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up => {
+                                focus = DialogFocus::Content;
+                            }
+                            KeyCode::Left => {
+                                button = button.saturating_sub(1);
+                                focus = DialogFocus::Actions(button);
+                            }
+                            KeyCode::Right => {
+                                button = (button + 1).min(3);
+                                focus = DialogFocus::Actions(button);
+                            }
+                            KeyCode::Home => focus = DialogFocus::Actions(0),
+                            KeyCode::End => focus = DialogFocus::Actions(3),
+                            KeyCode::Enter | KeyCode::Char(' ') => match button {
+                                0 => {
+                                    self.import_discovered(&provider_id, &choices);
+                                    return;
+                                }
+                                1 => {
+                                    for choice in &mut choices {
+                                        choice.selected = !choice.exists;
+                                    }
+                                }
+                                2 => {
+                                    for choice in &mut choices {
+                                        choice.selected = false;
+                                    }
+                                }
+                                _ => keep_open = false,
+                            },
+                            _ => {}
+                        },
+                    }
                 }
                 if cursor < scroll {
                     scroll = cursor;
@@ -795,6 +854,9 @@ impl App {
                     self.overlay = Some(Overlay::DiscoveryPicker {
                         provider_id,
                         choices,
+                        filtered,
+                        query,
+                        filter_active,
                         cursor,
                         scroll,
                         focus,
@@ -1657,6 +1719,18 @@ fn filter_known_models(choices: &[KnownModelChoice], query: &str) -> Vec<usize> 
     matched.into_iter().map(|(_, index)| index).collect()
 }
 
+fn filter_discovered_models(choices: &[DiscoveryChoice], query: &str) -> Vec<usize> {
+    let query = query.trim().to_ascii_lowercase();
+    choices
+        .iter()
+        .enumerate()
+        .filter(|(_, choice)| {
+            query.is_empty() || choice.model.id.to_ascii_lowercase().contains(&query)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 fn move_index(current: usize, amount: isize, max: usize) -> usize {
     if amount.is_negative() {
         current.saturating_sub(amount.unsigned_abs())
@@ -1823,6 +1897,9 @@ mod tests {
                 selected: false,
                 exists: false,
             }],
+            filtered: vec![0],
+            query: String::new(),
+            filter_active: false,
             cursor: 0,
             scroll: 0,
             focus: DialogFocus::Content,
@@ -1842,6 +1919,66 @@ mod tests {
             app.overlay,
             Some(Overlay::DiscoveryPicker {
                 focus: DialogFocus::Content,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn discovery_dialog_filters_by_model_id() {
+        let mut app = app();
+        app.overlay = Some(Overlay::DiscoveryPicker {
+            provider_id: "alpha".into(),
+            choices: vec![
+                DiscoveryChoice {
+                    model: DiscoveredModel {
+                        id: "gpt-5".into(),
+                        name: None,
+                        config: None,
+                    },
+                    selected: true,
+                    exists: false,
+                },
+                DiscoveryChoice {
+                    model: DiscoveredModel {
+                        id: "claude-sonnet".into(),
+                        name: None,
+                        config: None,
+                    },
+                    selected: true,
+                    exists: false,
+                },
+            ],
+            filtered: vec![0, 1],
+            query: String::new(),
+            filter_active: false,
+            cursor: 0,
+            scroll: 0,
+            focus: DialogFocus::Content,
+        });
+
+        press(&mut app, KeyCode::Char('/'));
+        for character in "claude".chars() {
+            press(&mut app, KeyCode::Char(character));
+        }
+        let Some(Overlay::DiscoveryPicker {
+            filtered,
+            query,
+            filter_active,
+            ..
+        }) = &app.overlay
+        else {
+            panic!("discovery picker should remain open")
+        };
+        assert_eq!(query, "claude");
+        assert_eq!(filtered, &[1]);
+        assert!(*filter_active);
+
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::DiscoveryPicker {
+                filter_active: false,
                 ..
             })
         ));

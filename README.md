@@ -95,6 +95,8 @@ ipmt [OPTIONS]
 
 已知模型快速导入会合并 `sub2api` 的 `model_prices_and_context_window.json` 与 `router-for-me/models`。相同模型 ID 优先使用 sub2api 的能力、上下文和价格；仅出现在 router-for-me 中的模型作为补充，因此快捷导入和 `f` 发现后的参数匹配都能覆盖更多模型。任一目录暂时不可用时仍会使用另一个目录。sub2api 的每 token 价格会转换为 pi 使用的每百万 token 价格；推理能力标记会转换为 `reasoning` 和 `thinkingLevelMap`。同时支持 `max` 与 `xhigh` 时，Claude 模型映射为 `{"xhigh":"max"}`，GPT 和其他模型映射为 `{"xhigh":"xhigh"}`。
 
+在 `f` 发现结果页面按 `/` 可进入模型 ID 筛选，输入内容时实时过滤；`Enter` 或 `Esc` 结束输入并保留筛选结果。筛选状态下的 Space、`a`、`x` 操作当前可见模型。
+
 ## 保存策略
 
 1. 重新比较磁盘内容，发现外部修改时停止保存。

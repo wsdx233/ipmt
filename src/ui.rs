@@ -444,7 +444,7 @@ fn overlay_mouse_action(app: &App, event: MouseEvent, terminal: Rect) -> Option<
             }
         }
         Overlay::DiscoveryPicker {
-            choices,
+            filtered,
             cursor,
             scroll: current_scroll,
             ..
@@ -459,7 +459,11 @@ fn overlay_mouse_action(app: &App, event: MouseEvent, terminal: Rect) -> Option<
                 let inner = modal_block("").inner(area);
                 let rows = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(4), Constraint::Length(1)])
+                    .constraints([
+                        Constraint::Length(2),
+                        Constraint::Min(4),
+                        Constraint::Length(1),
+                    ])
                     .split(inner);
                 let buttons = [
                     ActionButton {
@@ -479,18 +483,18 @@ fn overlay_mouse_action(app: &App, event: MouseEvent, terminal: Rect) -> Option<
                         color: MUTED,
                     },
                 ];
-                if let Some(index) = action_button_at(rows[1], &buttons, point) {
+                if let Some(index) = action_button_at(rows[2], &buttons, point) {
                     return Some(MouseAction::ActivateDialogButton(index));
                 }
-                if rows[0].contains(point) {
+                if rows[1].contains(point) {
                     let start = discovery_view_offset(
-                        choices.len(),
-                        rows[0].height as usize,
+                        filtered.len(),
+                        rows[1].height as usize,
                         *cursor,
                         *current_scroll,
                     );
-                    let index = start + (event.row - rows[0].y) as usize;
-                    if index < choices.len() {
+                    let index = start + (event.row - rows[1].y) as usize;
+                    if index < filtered.len() {
                         return Some(MouseAction::SelectDiscovered {
                             index,
                             toggle: button == MouseButton::Left,
@@ -595,6 +599,7 @@ fn apply_mouse_action(app: &mut App, action: MouseAction) {
         MouseAction::SelectDiscovered { index, toggle } => {
             if let Some(Overlay::DiscoveryPicker {
                 choices,
+                filtered,
                 cursor,
                 scroll,
                 focus,
@@ -607,7 +612,9 @@ fn apply_mouse_action(app: &mut App, action: MouseAction) {
                     *scroll = index;
                 }
                 if toggle
-                    && let Some(choice) = choices.get_mut(index)
+                    && let Some(choice) = filtered
+                        .get(index)
+                        .and_then(|source_index| choices.get_mut(*source_index))
                     && !choice.exists
                 {
                     choice.selected = !choice.selected;
@@ -638,13 +645,13 @@ fn scroll_overlay(app: &mut App, amount: isize) {
             form.mouse_select_field(selected, usize::MAX);
         }
         Some(Overlay::DiscoveryPicker {
-            choices,
+            filtered,
             cursor,
             scroll,
             focus,
             ..
         }) => {
-            *cursor = move_index(*cursor, amount, choices.len().saturating_sub(1));
+            *cursor = move_index(*cursor, amount, filtered.len().saturating_sub(1));
             *focus = DialogFocus::Content;
             if *cursor < *scroll {
                 *scroll = *cursor;
@@ -1404,6 +1411,9 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App, overlay: &Overlay, terminal: R
         Overlay::DiscoveryPicker {
             provider_id,
             choices,
+            filtered,
+            query,
+            filter_active,
             cursor,
             scroll,
             focus,
@@ -1412,6 +1422,9 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App, overlay: &Overlay, terminal: R
             terminal,
             provider_id,
             choices,
+            filtered,
+            query,
+            *filter_active,
             *cursor,
             *scroll,
             *focus,
@@ -1943,11 +1956,15 @@ fn draw_loading(frame: &mut Frame<'_>, terminal: Rect, provider_id: &str) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_discovery_picker(
     frame: &mut Frame<'_>,
     terminal: Rect,
     provider_id: &str,
     choices: &[crate::app::DiscoveryChoice],
+    filtered: &[usize],
+    query: &str,
+    filter_active: bool,
     cursor: usize,
     scroll: usize,
     focus: DialogFocus,
@@ -1955,20 +1972,53 @@ fn draw_discovery_picker(
     let area = modal_rect(terminal, 88, 28, 92, 88);
     let selected = choices.iter().filter(|item| item.selected).count();
     let existing = choices.iter().filter(|item| item.exists).count();
-    let title = format!(" 远程模型  {provider_id}  /  选择 {selected}  已有 {existing} ");
+    let title = format!(
+        " 远程模型  {provider_id}  /  {}/{}  选择 {selected}  已有 {existing} ",
+        filtered.len(),
+        choices.len()
+    );
     let block = modal_block(&title);
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(4), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
         .split(inner);
-    let visible = rows[0].height as usize;
-    let effective_scroll = discovery_view_offset(choices.len(), visible, cursor, scroll);
-    let end = (effective_scroll + visible).min(choices.len());
-    let items = choices[effective_scroll..end]
+    let filter_value = if query.is_empty() {
+        if filter_active {
+            ""
+        } else {
+            "按 / 根据模型 ID 筛选"
+        }
+    } else {
+        query
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                if filter_active {
+                    "/ 筛选  "
+                } else {
+                    " 筛选  "
+                },
+                Style::default().fg(if filter_active { CYAN } else { MUTED }),
+            ),
+            Span::styled(filter_value, Style::default().fg(TEXT)),
+        ]))
+        .style(Style::default().bg(SURFACE)),
+        rows[0],
+    );
+    let visible = rows[1].height as usize;
+    let effective_scroll = discovery_view_offset(filtered.len(), visible, cursor, scroll);
+    let end = (effective_scroll + visible).min(filtered.len());
+    let items = filtered[effective_scroll..end]
         .iter()
+        .filter_map(|index| choices.get(*index))
         .map(|choice| {
             let mark = if choice.exists {
                 Span::styled("[=]", Style::default().fg(MUTED))
@@ -1998,13 +2048,13 @@ fn draw_discovery_picker(
                 })
                 .bg(SURFACE),
         ),
-        rows[0],
+        rows[1],
         &mut state,
     );
-    draw_scrollbar(frame, rows[0], choices.len(), cursor);
+    draw_scrollbar(frame, rows[1], filtered.len(), cursor);
     draw_action_bar(
         frame,
-        rows[1],
+        rows[2],
         &[
             ActionButton {
                 label: "导入",
@@ -2028,6 +2078,14 @@ fn draw_discovery_picker(
             DialogFocus::Actions(button) => Some(button),
         },
     );
+    if filter_active {
+        let x = rows[0]
+            .x
+            .saturating_add(10)
+            .saturating_add(query.width() as u16)
+            .min(rows[0].right().saturating_sub(1));
+        frame.set_cursor_position(Position::new(x, rows[0].y));
+    }
 }
 
 fn draw_known_models_loading(frame: &mut Frame<'_>, terminal: Rect, provider_id: &str) {
