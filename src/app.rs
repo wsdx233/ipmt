@@ -138,7 +138,6 @@ struct DiscoveryResult {
 }
 
 struct KnownModelsResult {
-    provider_id: String,
     result: Result<Vec<KnownModel>, String>,
 }
 
@@ -159,6 +158,8 @@ pub struct App {
     redo: Vec<Value>,
     discovery_rx: Option<Receiver<DiscoveryResult>>,
     known_models_rx: Option<Receiver<KnownModelsResult>>,
+    known_models: Option<Vec<KnownModel>>,
+    known_models_pending_provider: Option<String>,
     last_list_click: Option<(Pane, usize, Instant)>,
 }
 
@@ -198,9 +199,16 @@ impl App {
             redo: Vec::new(),
             discovery_rx: None,
             known_models_rx: None,
+            known_models: None,
+            known_models_pending_provider: None,
             last_list_click: None,
         };
         app.normalize_selection();
+        // Unit tests should not create real network requests. The TUI starts this
+        // in the background so startup is never blocked by the remote catalogs.
+        if !cfg!(test) {
+            app.fetch_known_models_in_background();
+        }
         app
     }
 
@@ -873,8 +881,8 @@ impl App {
             }
             Overlay::KnownModelsLoading { provider_id } => {
                 if key.code == KeyCode::Esc {
-                    self.known_models_rx = None;
-                    self.set_status(StatusKind::Warning, "已忽略已知模型目录结果");
+                    self.known_models_pending_provider = None;
+                    self.set_status(StatusKind::Info, "已知模型目录将在后台继续获取");
                 } else {
                     self.overlay = Some(Overlay::KnownModelsLoading { provider_id });
                 }
@@ -1088,18 +1096,25 @@ impl App {
             return;
         };
         let provider_id = provider.summary.id;
-        let result_provider_id = provider_id.clone();
+        if let Some(models) = self.known_models.clone() {
+            self.show_known_models(provider_id, models);
+            return;
+        }
+        self.known_models_pending_provider = Some(provider_id.clone());
+        if self.known_models_rx.is_none() {
+            self.fetch_known_models_in_background();
+        }
+        self.overlay = Some(Overlay::KnownModelsLoading { provider_id });
+        self.set_status(StatusKind::Info, "正在获取已知模型数据...");
+    }
+
+    fn fetch_known_models_in_background(&mut self) {
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let result = fetch_known_models().map_err(|error| error.to_string());
-            let _ = sender.send(KnownModelsResult {
-                provider_id: result_provider_id,
-                result,
-            });
+            let _ = sender.send(KnownModelsResult { result });
         });
         self.known_models_rx = Some(receiver);
-        self.overlay = Some(Overlay::KnownModelsLoading { provider_id });
-        self.set_status(StatusKind::Info, "正在获取最新已知模型数据...");
     }
 
     fn poll_known_models(&mut self) {
@@ -1107,7 +1122,9 @@ impl App {
             Some(Ok(result)) => Some(result),
             Some(Err(TryRecvError::Disconnected)) => {
                 self.known_models_rx = None;
-                if matches!(self.overlay, Some(Overlay::KnownModelsLoading { .. })) {
+                if self.known_models_pending_provider.take().is_some()
+                    && matches!(self.overlay, Some(Overlay::KnownModelsLoading { .. }))
+                {
                     self.overlay = None;
                     self.set_status(StatusKind::Error, "已知模型目录任务意外结束");
                 }
@@ -1119,37 +1136,46 @@ impl App {
         self.known_models_rx = None;
         match result.result {
             Ok(models) => {
-                let existing: std::collections::HashSet<_> = self
-                    .doc
-                    .models(&result.provider_id)
-                    .into_iter()
-                    .map(|model| model.id)
-                    .collect();
-                let choices = models
-                    .into_iter()
-                    .map(|model| KnownModelChoice {
-                        exists: existing.contains(&model.id),
-                        model,
-                    })
-                    .collect::<Vec<_>>();
-                let filtered = (0..choices.len()).collect();
-                let count = choices.len();
-                self.overlay = Some(Overlay::KnownModelsPicker {
-                    provider_id: result.provider_id,
-                    choices,
-                    filtered,
-                    query: String::new(),
-                    cursor: 0,
-                    scroll: 0,
-                    focus: DialogFocus::Content,
-                });
-                self.set_status(StatusKind::Success, format!("已载入 {count} 个已知模型"));
+                self.known_models = Some(models.clone());
+                if let Some(provider_id) = self.known_models_pending_provider.take() {
+                    self.show_known_models(provider_id, models);
+                }
             }
             Err(error) => {
-                self.overlay = None;
-                self.set_status(StatusKind::Error, error);
+                if self.known_models_pending_provider.take().is_some() {
+                    self.overlay = None;
+                    self.set_status(StatusKind::Error, error);
+                }
             }
         }
+    }
+
+    fn show_known_models(&mut self, provider_id: String, models: Vec<KnownModel>) {
+        let existing: std::collections::HashSet<_> = self
+            .doc
+            .models(&provider_id)
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        let choices = models
+            .into_iter()
+            .map(|model| KnownModelChoice {
+                exists: existing.contains(&model.id),
+                model,
+            })
+            .collect::<Vec<_>>();
+        let filtered = (0..choices.len()).collect();
+        let count = choices.len();
+        self.overlay = Some(Overlay::KnownModelsPicker {
+            provider_id,
+            choices,
+            filtered,
+            query: String::new(),
+            cursor: 0,
+            scroll: 0,
+            focus: DialogFocus::Content,
+        });
+        self.set_status(StatusKind::Success, format!("已载入 {count} 个已知模型"));
     }
 
     fn import_known_model(&mut self, provider_id: &str, choice: &KnownModelChoice) {
