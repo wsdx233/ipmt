@@ -20,7 +20,9 @@ IPMT 编辑的是 pi 的 `models.json`，不修改内置模型缓存 `models-sto
 
 ## 安装
 
-Linux x86_64 可以从最新 GitHub Release 自动下载、校验并安装到 `~/.local/bin`：
+### Linux 一键安装
+
+复制并执行下面这条命令，即可从最新 GitHub Release 自动下载、校验并安装到 `~/.local/bin`（支持 Linux x86_64）：
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/wsdx233/ipmt/master/install.sh | sh
