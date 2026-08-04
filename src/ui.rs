@@ -2050,7 +2050,7 @@ fn draw_known_models_loading(frame: &mut Frame<'_>, terminal: Rect, provider_id:
             ]),
             Line::default(),
             Line::styled(
-                "正在从 sub2api 获取最新模型能力与价格...",
+                "正在合并 sub2api 与 router-for-me 最新模型数据...",
                 Style::default().fg(MUTED),
             ),
             Line::styled("Esc 忽略结果", Style::default().fg(MUTED)),

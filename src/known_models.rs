@@ -5,6 +5,8 @@ use serde_json::{Map, Number, Value};
 use thiserror::Error;
 
 pub const KNOWN_MODELS_URL: &str = "https://raw.githubusercontent.com/Wei-Shaw/sub2api/main/backend/resources/model-pricing/model_prices_and_context_window.json";
+pub const FALLBACK_MODELS_URL: &str =
+    "https://raw.githubusercontent.com/router-for-me/models/main/models.json";
 const MAX_CATALOG_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -38,8 +40,21 @@ pub fn fetch_known_models() -> Result<Vec<KnownModel>, KnownCatalogError> {
         .user_agent(concat!("ipmt/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(KnownCatalogError::Request)?;
+    let primary =
+        fetch_catalog(&client, KNOWN_MODELS_URL).and_then(|root| parse_known_models(&root));
+    let fallback =
+        fetch_catalog(&client, FALLBACK_MODELS_URL).and_then(|root| parse_fallback_models(&root));
+    match (primary, fallback) {
+        (Ok(primary), Ok(fallback)) => Ok(merge_known_models(primary, fallback)),
+        (Ok(primary), Err(_)) => Ok(primary),
+        (Err(_), Ok(fallback)) => Ok(fallback),
+        (Err(error), Err(_)) => Err(error),
+    }
+}
+
+fn fetch_catalog(client: &Client, url: &str) -> Result<Value, KnownCatalogError> {
     let response = client
-        .get(KNOWN_MODELS_URL)
+        .get(url)
         .send()
         .map_err(|error| KnownCatalogError::Request(error.without_url()))?;
     if !response.status().is_success() {
@@ -57,8 +72,7 @@ pub fn fetch_known_models() -> Result<Vec<KnownModel>, KnownCatalogError> {
     if bytes.len() > MAX_CATALOG_BYTES {
         return Err(KnownCatalogError::TooLarge);
     }
-    let root: Value = serde_json::from_slice(&bytes).map_err(KnownCatalogError::Json)?;
-    parse_known_models(&root)
+    serde_json::from_slice(&bytes).map_err(KnownCatalogError::Json)
 }
 
 pub fn parse_known_models(root: &Value) -> Result<Vec<KnownModel>, KnownCatalogError> {
@@ -80,6 +94,93 @@ pub fn parse_known_models(root: &Value) -> Result<Vec<KnownModel>, KnownCatalogE
         Err(KnownCatalogError::Empty)
     } else {
         Ok(models)
+    }
+}
+
+fn parse_fallback_models(root: &Value) -> Result<Vec<KnownModel>, KnownCatalogError> {
+    let groups = root.as_object().ok_or(KnownCatalogError::InvalidFormat)?;
+    let mut models = Vec::new();
+    for (family, entries) in groups {
+        let Some(entries) = entries.as_array() else {
+            continue;
+        };
+        for entry in entries {
+            let Some(source) = entry.as_object() else {
+                continue;
+            };
+            let Some(id) = source.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if !id.trim().is_empty() {
+                models.push(fallback_model(family, id, source));
+            }
+        }
+    }
+    if models.is_empty() {
+        Err(KnownCatalogError::Empty)
+    } else {
+        Ok(merge_known_models(Vec::new(), models))
+    }
+}
+
+fn merge_known_models(primary: Vec<KnownModel>, fallback: Vec<KnownModel>) -> Vec<KnownModel> {
+    let mut ids = primary
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut merged = primary;
+    for model in fallback {
+        if ids.insert(model.id.clone()) {
+            merged.push(model);
+        }
+    }
+    merged
+}
+
+fn fallback_model(family: &str, id: &str, source: &Map<String, Value>) -> KnownModel {
+    let name = source
+        .get("display_name")
+        .or_else(|| source.get("displayName"))
+        .and_then(Value::as_str)
+        .filter(|name| *name != id)
+        .map(ToOwned::to_owned);
+    let mut value = Map::new();
+    value.insert("id".into(), Value::String(id.to_owned()));
+    if let Some(name) = &name {
+        value.insert("name".into(), Value::String(name.clone()));
+    }
+    if source.get("thinking").is_some_and(Value::is_object) {
+        value.insert("reasoning".into(), Value::Bool(true));
+    }
+    let supports_image = source
+        .get("supportedInputModalities")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("image")));
+    value.insert(
+        "input".into(),
+        Value::Array(if supports_image {
+            vec![Value::String("text".into()), Value::String("image".into())]
+        } else {
+            vec![Value::String("text".into())]
+        }),
+    );
+    copy_u64(
+        source,
+        &mut value,
+        &["context_length", "inputTokenLimit"],
+        "contextWindow",
+    );
+    copy_u64(
+        source,
+        &mut value,
+        &["max_completion_tokens", "outputTokenLimit"],
+        "maxTokens",
+    );
+    KnownModel {
+        id: id.to_owned(),
+        name,
+        family: family.to_owned(),
+        value: Value::Object(value),
     }
 }
 
@@ -267,5 +368,33 @@ mod tests {
         .unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "chat-model");
+    }
+
+    #[test]
+    fn primary_catalog_wins_and_fallback_fills_missing_ids() {
+        let primary = parse_known_models(&json!({
+            "shared": {
+                "mode":"chat",
+                "litellm_provider":"openai",
+                "max_input_tokens":400000,
+                "input_cost_per_token":0.000002
+            }
+        }))
+        .unwrap();
+        let fallback = parse_fallback_models(&json!({
+            "openai": [
+                {"id":"shared", "context_length":128000},
+                {"id":"fallback-only", "context_length":200000, "thinking":{}}
+            ]
+        }))
+        .unwrap();
+        let merged = merge_known_models(primary, fallback);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, "shared");
+        assert_eq!(merged[0].value["contextWindow"], 400000);
+        assert_eq!(merged[0].value["cost"]["input"], 2.0);
+        assert_eq!(merged[1].id, "fallback-only");
+        assert_eq!(merged[1].value["contextWindow"], 200000);
+        assert_eq!(merged[1].value["reasoning"], true);
     }
 }
