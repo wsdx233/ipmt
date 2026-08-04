@@ -7,7 +7,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -142,7 +145,17 @@ fn run_tui(app: &mut App) -> Result<()> {
             break;
         }
         if event::poll(Duration::from_millis(80))? {
-            app.handle_event(event::read()?);
+            match event::read()? {
+                Event::Mouse(mouse) => {
+                    let size = terminal.size()?;
+                    ui::handle_mouse(
+                        app,
+                        mouse,
+                        ratatui::layout::Rect::new(0, 0, size.width, size.height),
+                    );
+                }
+                event => app.handle_event(event),
+            }
         }
     }
     Ok(())
@@ -151,7 +164,20 @@ fn run_tui(app: &mut App) -> Result<()> {
 fn enter_terminal() -> Result<(TerminalGuard, Terminal<CrosstermBackend<Stdout>>)> {
     enable_raw_mode().context("无法启用终端 raw mode")?;
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, Hide) {
+    if let Err(error) = execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture,
+        Hide
+    ) {
+        let _ = execute!(
+            stdout,
+            Show,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
         return Err(error).context("无法进入终端界面");
     }
@@ -165,13 +191,14 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
             Show,
+            DisableMouseCapture,
             DisableBracketedPaste,
             LeaveAlternateScreen
         );
+        let _ = disable_raw_mode();
     }
 }
 

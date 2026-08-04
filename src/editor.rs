@@ -406,6 +406,43 @@ impl FormState {
         &mut self.fields[self.selected]
     }
 
+    pub fn mouse_select_field(&mut self, index: usize, value_column: usize) {
+        if index >= self.fields.len() {
+            return;
+        }
+        self.selected = index;
+        self.error = None;
+        let field = self.current();
+        if !field.is_editable_text() {
+            self.cursor = 0;
+            return;
+        }
+        if matches!(field.kind, FieldKind::Secret) && !self.reveal_secrets {
+            self.cursor = grapheme_count(&field.value);
+            return;
+        }
+
+        let mut width = 0;
+        let mut cursor = 0;
+        for grapheme in field.value.graphemes(true) {
+            let next = width + grapheme.width();
+            if value_column < next {
+                break;
+            }
+            width = next;
+            cursor += 1;
+        }
+        self.cursor = cursor;
+    }
+
+    pub fn mouse_activate_field(&mut self, direction: isize) {
+        match self.current().kind {
+            FieldKind::Bool => self.toggle_bool(),
+            FieldKind::Select(_) => self.cycle_select(direction),
+            _ => {}
+        }
+    }
+
     pub fn cursor_display_width(&self) -> usize {
         let field = self.current();
         if matches!(field.kind, FieldKind::Secret) && !self.reveal_secrets {

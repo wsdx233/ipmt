@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use fuzzy_matcher::FuzzyMatcher;
@@ -121,6 +122,7 @@ pub struct App {
     undo: Vec<Value>,
     redo: Vec<Value>,
     discovery_rx: Option<Receiver<DiscoveryResult>>,
+    last_list_click: Option<(Pane, usize, Instant)>,
 }
 
 impl App {
@@ -158,6 +160,7 @@ impl App {
             undo: Vec::new(),
             redo: Vec::new(),
             discovery_rx: None,
+            last_list_click: None,
         };
         app.normalize_selection();
         app
@@ -334,9 +337,66 @@ impl App {
         }
     }
 
+    pub fn mouse_select_list(&mut self, pane: Pane, index: usize, activate: bool) {
+        let valid = match pane {
+            Pane::Providers => index < self.visible_providers().len(),
+            Pane::Models => index < self.visible_models().len(),
+        };
+        if !valid {
+            return;
+        }
+
+        let now = Instant::now();
+        let double_click = self
+            .last_list_click
+            .is_some_and(|(last_pane, last_index, at)| {
+                last_pane == pane
+                    && last_index == index
+                    && now.duration_since(at) <= Duration::from_millis(450)
+            });
+        match pane {
+            Pane::Providers => {
+                if self.provider_cursor != index {
+                    self.model_cursor = 0;
+                }
+                self.provider_cursor = index;
+            }
+            Pane::Models => self.model_cursor = index,
+        }
+        self.focus = pane;
+
+        if activate || double_click {
+            self.last_list_click = None;
+            self.edit_selected();
+        } else {
+            self.last_list_click = Some((pane, index, now));
+        }
+    }
+
+    pub fn mouse_scroll_list(&mut self, pane: Pane, amount: isize) {
+        self.focus = pane;
+        self.last_list_click = None;
+        self.move_selection(amount);
+    }
+
+    pub fn mouse_activate_search(&mut self) {
+        self.search_active = true;
+        self.last_list_click = None;
+    }
+
+    pub fn mouse_clear_search(&mut self) {
+        self.search.clear();
+        self.search_active = false;
+        self.provider_cursor = 0;
+        self.model_cursor = 0;
+        self.last_list_click = None;
+        self.normalize_selection();
+    }
+
     pub fn handle_event(&mut self, event: Event) {
         match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                self.last_list_click = None;
                 if self.overlay.is_some() {
                     self.handle_overlay_key(key);
                 } else if self.search_active {
@@ -1277,6 +1337,30 @@ mod tests {
         assert_eq!(app.doc.root(), &original);
         app.redo();
         assert!(app.doc.provider_value("alpha").is_none());
+    }
+
+    #[test]
+    fn mouse_click_selects_and_double_click_opens_editor() {
+        let mut app = app();
+        app.mouse_select_list(Pane::Providers, 1, false);
+        assert_eq!(app.provider_cursor, 1);
+        assert_eq!(app.focus, Pane::Providers);
+        assert!(app.overlay.is_none());
+
+        app.mouse_select_list(Pane::Providers, 1, false);
+        assert!(matches!(app.overlay, Some(Overlay::Form(_))));
+    }
+
+    #[test]
+    fn mouse_wheel_moves_the_target_list() {
+        let mut app = app();
+        app.mouse_scroll_list(Pane::Providers, 3);
+        assert_eq!(app.provider_cursor, 1);
+        app.provider_cursor = 0;
+        app.focus = Pane::Models;
+        app.model_cursor = 0;
+        app.mouse_scroll_list(Pane::Models, 3);
+        assert_eq!(app.model_cursor, 1);
     }
 
     #[test]

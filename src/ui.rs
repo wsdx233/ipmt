@@ -1,5 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -29,15 +32,22 @@ const RED: Color = Color::Rgb(225, 90, 90);
 const MAGENTA: Color = Color::Rgb(190, 120, 200);
 const BLUE: Color = Color::Rgb(90, 145, 220);
 
-pub fn draw(frame: &mut Frame<'_>, app: &App) {
-    let area = frame.area();
-    frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
+#[derive(Debug, Clone, Copy)]
+struct ScreenRegions {
+    header: Rect,
+    workspace: Rect,
+    status: Rect,
+    commands: Rect,
+}
 
-    if area.width < 42 || area.height < 12 {
-        draw_too_small(frame, area);
-        return;
-    }
+#[derive(Debug, Clone, Copy)]
+struct WorkspaceRegions {
+    providers: Option<Rect>,
+    models: Option<Rect>,
+    details: Rect,
+}
 
+fn screen_regions(area: Rect) -> ScreenRegions {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -47,14 +57,627 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
             Constraint::Length(1),
         ])
         .split(area);
+    ScreenRegions {
+        header: rows[0],
+        workspace: rows[1],
+        status: rows[2],
+        commands: rows[3],
+    }
+}
 
-    draw_header(frame, app, rows[0]);
-    draw_workspace(frame, app, rows[1]);
-    draw_status(frame, app, rows[2]);
-    draw_commands(frame, app, rows[3]);
+fn workspace_regions(area: Rect, focus: Pane) -> WorkspaceRegions {
+    if area.width >= 110 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(27),
+                Constraint::Percentage(34),
+                Constraint::Min(36),
+            ])
+            .split(area);
+        WorkspaceRegions {
+            providers: Some(columns[0]),
+            models: Some(columns[1]),
+            details: columns[2],
+        }
+    } else if area.width >= 76 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(61), Constraint::Min(6)])
+            .split(area);
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+            .split(rows[0]);
+        WorkspaceRegions {
+            providers: Some(columns[0]),
+            models: Some(columns[1]),
+            details: rows[1],
+        }
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(62), Constraint::Min(5)])
+            .split(area);
+        WorkspaceRegions {
+            providers: (focus == Pane::Providers).then_some(rows[0]),
+            models: (focus == Pane::Models).then_some(rows[0]),
+            details: rows[1],
+        }
+    }
+}
+
+pub fn draw(frame: &mut Frame<'_>, app: &App) {
+    let area = frame.area();
+    frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
+
+    if area.width < 42 || area.height < 12 {
+        draw_too_small(frame, area);
+        return;
+    }
+
+    let regions = screen_regions(area);
+    draw_header(frame, app, regions.header);
+    draw_workspace(frame, app, regions.workspace);
+    draw_status(frame, app, regions.status);
+    draw_commands(frame, app, regions.commands);
 
     if let Some(overlay) = &app.overlay {
         draw_overlay(frame, app, overlay, area);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MouseAction {
+    Key(KeyCode, KeyModifiers),
+    SelectList {
+        pane: Pane,
+        index: usize,
+        activate: bool,
+    },
+    ScrollList {
+        pane: Pane,
+        amount: isize,
+    },
+    ActivateSearch,
+    ClearSearch,
+    SelectTemplate {
+        index: usize,
+        activate: bool,
+    },
+    SelectFormField {
+        index: usize,
+        value_column: usize,
+        activate: Option<isize>,
+    },
+    SelectDiscovered {
+        index: usize,
+        toggle: bool,
+    },
+    ScrollOverlay(isize),
+}
+
+pub fn handle_mouse(app: &mut App, event: MouseEvent, terminal: Rect) {
+    if terminal.width < 42
+        || terminal.height < 12
+        || matches!(event.kind, MouseEventKind::Down(MouseButton::Middle))
+    {
+        return;
+    }
+    let action = if app.overlay.is_some() {
+        overlay_mouse_action(app, event, terminal)
+    } else {
+        base_mouse_action(app, event, terminal)
+    };
+    if let Some(action) = action {
+        apply_mouse_action(app, action);
+    }
+}
+
+fn base_mouse_action(app: &App, event: MouseEvent, terminal: Rect) -> Option<MouseAction> {
+    let regions = screen_regions(terminal);
+    let workspace = workspace_regions(regions.workspace, app.focus);
+    let point = Position::new(event.column, event.row);
+
+    match event.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let amount = if event.kind == MouseEventKind::ScrollUp {
+                -3
+            } else {
+                3
+            };
+            if workspace.providers.is_some_and(|area| area.contains(point)) {
+                return Some(MouseAction::ScrollList {
+                    pane: Pane::Providers,
+                    amount,
+                });
+            }
+            if workspace.models.is_some_and(|area| area.contains(point)) {
+                return Some(MouseAction::ScrollList {
+                    pane: Pane::Models,
+                    amount,
+                });
+            }
+            return None;
+        }
+        MouseEventKind::Down(button) => {
+            if event.row == regions.header.y + 2 {
+                return match button {
+                    MouseButton::Left => Some(MouseAction::ActivateSearch),
+                    MouseButton::Right => Some(MouseAction::ClearSearch),
+                    _ => None,
+                };
+            }
+            if button == MouseButton::Left && regions.status.contains(point) {
+                return Some(MouseAction::Key(KeyCode::Char('v'), KeyModifiers::NONE));
+            }
+            if button == MouseButton::Left && regions.commands.contains(point) {
+                return command_at(app, regions.commands, event.column)
+                    .map(|command| MouseAction::Key(command.code, command.modifiers));
+            }
+            if let Some(area) = workspace.providers
+                && area.contains(point)
+                && let Some(index) = list_index_at(
+                    app.visible_providers().len(),
+                    area,
+                    app.provider_cursor,
+                    event.row,
+                )
+            {
+                return Some(MouseAction::SelectList {
+                    pane: Pane::Providers,
+                    index,
+                    activate: button == MouseButton::Right,
+                });
+            }
+            if let Some(area) = workspace.models
+                && area.contains(point)
+                && let Some(index) = list_index_at(
+                    app.visible_models().len(),
+                    area,
+                    app.model_cursor,
+                    event.row,
+                )
+            {
+                return Some(MouseAction::SelectList {
+                    pane: Pane::Models,
+                    index,
+                    activate: button == MouseButton::Right,
+                });
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+fn overlay_mouse_action(app: &App, event: MouseEvent, terminal: Rect) -> Option<MouseAction> {
+    let overlay = app.overlay.as_ref()?;
+    let point = Position::new(event.column, event.row);
+    let scroll = match event.kind {
+        MouseEventKind::ScrollUp => Some(-3),
+        MouseEventKind::ScrollDown => Some(3),
+        _ => None,
+    };
+
+    match overlay {
+        Overlay::Help { .. } => {
+            let area = modal_rect(terminal, 78, 30, 84, 84);
+            if let Some(amount) = scroll
+                && area.contains(point)
+            {
+                return Some(MouseAction::ScrollOverlay(amount));
+            }
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                && !area.contains(point)
+            {
+                return Some(MouseAction::Key(KeyCode::Esc, KeyModifiers::NONE));
+            }
+        }
+        Overlay::Diagnostics { .. } => {
+            let area = modal_rect(terminal, 90, 28, 90, 82);
+            if let Some(amount) = scroll
+                && area.contains(point)
+            {
+                return Some(MouseAction::ScrollOverlay(amount));
+            }
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                && !area.contains(point)
+            {
+                return Some(MouseAction::Key(KeyCode::Esc, KeyModifiers::NONE));
+            }
+        }
+        Overlay::Templates { selected } => {
+            let area = modal_rect(terminal, 72, 20, 82, 72);
+            if let Some(amount) = scroll
+                && area.contains(point)
+            {
+                return Some(MouseAction::ScrollOverlay(amount));
+            }
+            let inner = modal_block("").inner(area);
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(4), Constraint::Length(1)])
+                .split(inner);
+            if let MouseEventKind::Down(button) = event.kind {
+                let buttons = [
+                    ActionButton {
+                        label: "选择",
+                        color: GREEN,
+                    },
+                    ActionButton {
+                        label: "取消",
+                        color: MUTED,
+                    },
+                ];
+                if let Some(index) = action_button_at(rows[1], &buttons, point) {
+                    return Some(MouseAction::Key(
+                        if index == 0 {
+                            KeyCode::Enter
+                        } else {
+                            KeyCode::Esc
+                        },
+                        KeyModifiers::NONE,
+                    ));
+                }
+                if rows[0].contains(point) {
+                    let visible = (rows[0].height as usize / 2).max(1);
+                    let offset = list_view_offset(PROVIDER_TEMPLATES.len(), visible, *selected);
+                    let index = offset + (event.row - rows[0].y) as usize / 2;
+                    if index < PROVIDER_TEMPLATES.len() {
+                        return Some(MouseAction::SelectTemplate {
+                            index,
+                            activate: button == MouseButton::Right,
+                        });
+                    }
+                }
+            }
+        }
+        Overlay::Confirm { message, .. } => {
+            let width = (message.width() as u16 + 8).clamp(44, 76);
+            let area = modal_rect(terminal, width, 9, 90, 60);
+            if let MouseEventKind::Down(MouseButton::Left) = event.kind {
+                let inner = modal_block("").inner(area);
+                let rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(3), Constraint::Length(1)])
+                    .split(inner);
+                let buttons = [
+                    ActionButton {
+                        label: "确认",
+                        color: RED,
+                    },
+                    ActionButton {
+                        label: "取消",
+                        color: MUTED,
+                    },
+                ];
+                if let Some(index) = action_button_at(rows[1], &buttons, point) {
+                    return Some(MouseAction::Key(
+                        if index == 0 {
+                            KeyCode::Enter
+                        } else {
+                            KeyCode::Esc
+                        },
+                        KeyModifiers::NONE,
+                    ));
+                }
+                if !area.contains(point) {
+                    return Some(MouseAction::Key(KeyCode::Esc, KeyModifiers::NONE));
+                }
+            }
+        }
+        Overlay::Form(form) => {
+            let preferred_height = (form.fields.len() as u16 + 7).clamp(15, 28);
+            let area = modal_rect(terminal, 98, preferred_height, 94, 92);
+            if let Some(amount) = scroll
+                && area.contains(point)
+            {
+                return Some(MouseAction::ScrollOverlay(amount));
+            }
+            if let MouseEventKind::Down(button) = event.kind {
+                let inner = modal_block("").inner(area);
+                let rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(4),
+                        Constraint::Length(3),
+                        Constraint::Length(1),
+                    ])
+                    .split(inner);
+                let buttons = [
+                    ActionButton {
+                        label: "应用",
+                        color: GREEN,
+                    },
+                    ActionButton {
+                        label: "取消",
+                        color: MUTED,
+                    },
+                ];
+                if let Some(index) = action_button_at(rows[2], &buttons, point) {
+                    return Some(MouseAction::Key(
+                        if index == 0 {
+                            KeyCode::Char('s')
+                        } else {
+                            KeyCode::Esc
+                        },
+                        if index == 0 {
+                            KeyModifiers::CONTROL
+                        } else {
+                            KeyModifiers::NONE
+                        },
+                    ));
+                }
+                if rows[0].contains(point) {
+                    let start = form_field_start(form, rows[0].height as usize);
+                    let index = start + (event.row - rows[0].y) as usize;
+                    if index < form.fields.len() {
+                        let label_width = if rows[0].width >= 72 { 20 } else { 14 };
+                        let label_width = label_width.min(rows[0].width.saturating_sub(4));
+                        let value_x = rows[0].x.saturating_add(label_width);
+                        let value_width = rows[0].right().saturating_sub(value_x);
+                        let horizontal_scroll =
+                            if index == form.selected && form.fields[index].is_editable_text() {
+                                let available = value_width.saturating_sub(1) as usize;
+                                form.cursor_display_width()
+                                    .saturating_sub(available.saturating_sub(1))
+                            } else {
+                                0
+                            };
+                        let value_column = (event.column.saturating_sub(value_x) as usize)
+                            .saturating_add(horizontal_scroll);
+                        let activate = (event.column >= value_x)
+                            .then_some(if button == MouseButton::Right { -1 } else { 1 });
+                        return Some(MouseAction::SelectFormField {
+                            index,
+                            value_column,
+                            activate,
+                        });
+                    }
+                }
+            }
+        }
+        Overlay::DiscoveryLoading { .. } => {
+            let area = modal_rect(terminal, 54, 9, 84, 54);
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Right))
+                || matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                    && !area.contains(point)
+            {
+                return Some(MouseAction::Key(KeyCode::Esc, KeyModifiers::NONE));
+            }
+        }
+        Overlay::DiscoveryPicker {
+            choices,
+            cursor,
+            scroll: current_scroll,
+            ..
+        } => {
+            let area = modal_rect(terminal, 88, 28, 92, 88);
+            if let Some(amount) = scroll
+                && area.contains(point)
+            {
+                return Some(MouseAction::ScrollOverlay(amount));
+            }
+            if let MouseEventKind::Down(button) = event.kind {
+                let inner = modal_block("").inner(area);
+                let rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(4), Constraint::Length(1)])
+                    .split(inner);
+                let buttons = [
+                    ActionButton {
+                        label: "导入",
+                        color: GREEN,
+                    },
+                    ActionButton {
+                        label: "全选",
+                        color: TEXT,
+                    },
+                    ActionButton {
+                        label: "清空",
+                        color: YELLOW,
+                    },
+                    ActionButton {
+                        label: "取消",
+                        color: MUTED,
+                    },
+                ];
+                if let Some(index) = action_button_at(rows[1], &buttons, point) {
+                    let code = match index {
+                        0 => KeyCode::Enter,
+                        1 => KeyCode::Char('a'),
+                        2 => KeyCode::Char('x'),
+                        _ => KeyCode::Esc,
+                    };
+                    return Some(MouseAction::Key(code, KeyModifiers::NONE));
+                }
+                if rows[0].contains(point) {
+                    let start = discovery_view_offset(
+                        choices.len(),
+                        rows[0].height as usize,
+                        *cursor,
+                        *current_scroll,
+                    );
+                    let index = start + (event.row - rows[0].y) as usize;
+                    if index < choices.len() {
+                        return Some(MouseAction::SelectDiscovered {
+                            index,
+                            toggle: button == MouseButton::Left,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn apply_mouse_action(app: &mut App, action: MouseAction) {
+    match action {
+        MouseAction::Key(code, modifiers) => {
+            app.handle_event(Event::Key(KeyEvent::new(code, modifiers)));
+        }
+        MouseAction::SelectList {
+            pane,
+            index,
+            activate,
+        } => app.mouse_select_list(pane, index, activate),
+        MouseAction::ScrollList { pane, amount } => app.mouse_scroll_list(pane, amount),
+        MouseAction::ActivateSearch => app.mouse_activate_search(),
+        MouseAction::ClearSearch => app.mouse_clear_search(),
+        MouseAction::SelectTemplate { index, activate } => {
+            if let Some(Overlay::Templates { selected }) = app.overlay.as_mut() {
+                *selected = index;
+            }
+            if activate {
+                app.handle_event(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )));
+            }
+        }
+        MouseAction::SelectFormField {
+            index,
+            value_column,
+            activate,
+        } => {
+            if let Some(Overlay::Form(form)) = app.overlay.as_mut() {
+                form.mouse_select_field(index, value_column);
+                if let Some(direction) = activate {
+                    form.mouse_activate_field(direction);
+                }
+            }
+        }
+        MouseAction::SelectDiscovered { index, toggle } => {
+            if let Some(Overlay::DiscoveryPicker {
+                choices,
+                cursor,
+                scroll,
+                ..
+            }) = app.overlay.as_mut()
+            {
+                *cursor = index;
+                if index < *scroll {
+                    *scroll = index;
+                }
+                if toggle
+                    && let Some(choice) = choices.get_mut(index)
+                    && !choice.exists
+                {
+                    choice.selected = !choice.selected;
+                }
+            }
+        }
+        MouseAction::ScrollOverlay(amount) => scroll_overlay(app, amount),
+    }
+}
+
+fn scroll_overlay(app: &mut App, amount: isize) {
+    match app.overlay.as_mut() {
+        Some(Overlay::Help { scroll }) | Some(Overlay::Diagnostics { scroll }) => {
+            *scroll = move_index(*scroll, amount, usize::MAX);
+        }
+        Some(Overlay::Templates { selected }) => {
+            *selected = move_index(*selected, amount.signum(), PROVIDER_TEMPLATES.len() - 1);
+        }
+        Some(Overlay::Form(form)) => {
+            let selected = move_index(
+                form.selected,
+                amount.signum(),
+                form.fields.len().saturating_sub(1),
+            );
+            form.mouse_select_field(selected, usize::MAX);
+        }
+        Some(Overlay::DiscoveryPicker {
+            choices,
+            cursor,
+            scroll,
+            ..
+        }) => {
+            *cursor = move_index(*cursor, amount, choices.len().saturating_sub(1));
+            if *cursor < *scroll {
+                *scroll = *cursor;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn command_at(app: &App, area: Rect, column: u16) -> Option<CommandSpec> {
+    let mut x = area.x;
+    for command in command_specs(area.width, app) {
+        let width = command.label.width() as u16;
+        if column >= x && column < x.saturating_add(width) {
+            return Some(command);
+        }
+        x = x.saturating_add(width);
+        if x >= area.right() {
+            break;
+        }
+    }
+    None
+}
+
+fn list_index_at(length: usize, area: Rect, selected: usize, row: u16) -> Option<usize> {
+    let inner = area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    if row < inner.y || row >= inner.bottom() || inner.height == 0 {
+        return None;
+    }
+    let offset = list_view_offset(length, inner.height as usize, selected);
+    let index = offset + (row - inner.y) as usize;
+    (index < length).then_some(index)
+}
+
+fn list_view_offset(length: usize, visible: usize, selected: usize) -> usize {
+    if visible == 0 || length <= visible {
+        0
+    } else {
+        selected
+            .saturating_sub(visible - 1)
+            .min(length.saturating_sub(visible))
+    }
+}
+
+fn form_field_start(form: &FormState, visible: usize) -> usize {
+    let mut start = form.scroll.min(form.fields.len().saturating_sub(1));
+    if form.selected < start {
+        start = form.selected;
+    } else if form.selected >= start.saturating_add(visible) {
+        start = form.selected + 1 - visible;
+    }
+    start
+}
+
+fn discovery_view_offset(
+    length: usize,
+    visible: usize,
+    cursor: usize,
+    current_scroll: usize,
+) -> usize {
+    let mut scroll = current_scroll.min(length.saturating_sub(1));
+    if cursor < scroll {
+        scroll = cursor;
+    } else if cursor >= scroll.saturating_add(visible) {
+        scroll = cursor + 1 - visible.max(1);
+    }
+    scroll
+}
+
+fn action_button_at(area: Rect, buttons: &[ActionButton], point: Position) -> Option<usize> {
+    action_button_rects(area, buttons)
+        .iter()
+        .position(|rect| rect.contains(point))
+}
+
+fn move_index(current: usize, amount: isize, max: usize) -> usize {
+    if amount.is_negative() {
+        current.saturating_sub(amount.unsigned_abs())
+    } else {
+        current.saturating_add(amount as usize).min(max)
     }
 }
 
@@ -151,41 +774,14 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn draw_workspace(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    if area.width >= 110 {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(27),
-                Constraint::Percentage(34),
-                Constraint::Min(36),
-            ])
-            .split(area);
-        draw_providers(frame, app, columns[0]);
-        draw_models(frame, app, columns[1]);
-        draw_details(frame, app, columns[2]);
-    } else if area.width >= 76 {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(61), Constraint::Min(6)])
-            .split(area);
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-            .split(rows[0]);
-        draw_providers(frame, app, columns[0]);
-        draw_models(frame, app, columns[1]);
-        draw_details(frame, app, rows[1]);
-    } else {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(62), Constraint::Min(5)])
-            .split(area);
-        match app.focus {
-            Pane::Providers => draw_providers(frame, app, rows[0]),
-            Pane::Models => draw_models(frame, app, rows[0]),
-        }
-        draw_details(frame, app, rows[1]);
+    let regions = workspace_regions(area, app.focus);
+    if let Some(providers) = regions.providers {
+        draw_providers(frame, app, providers);
     }
+    if let Some(models) = regions.models {
+        draw_models(frame, app, models);
+    }
+    draw_details(frame, app, regions.details);
 }
 
 fn draw_providers(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -537,25 +1133,184 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn draw_commands(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let command = if area.width >= 100 {
-        " n 新增  e 编辑  d 删除  c 复制  / 搜索  f 发现  s 保存  v 校验  F1 帮助  q 退出"
-    } else if area.width >= 66 {
-        " n 新增  e 编辑  d 删除  / 搜索  f 发现  s 保存  F1 帮助"
+#[derive(Debug, Clone, Copy)]
+struct CommandSpec {
+    label: &'static str,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    color: Color,
+}
+
+fn command_specs(width: u16, app: &App) -> Vec<CommandSpec> {
+    let normal = KeyModifiers::NONE;
+    let mut commands = if width >= 100 {
+        vec![
+            CommandSpec {
+                label: " n 新增 ",
+                code: KeyCode::Char('n'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " e 编辑 ",
+                code: KeyCode::Char('e'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " d 删除 ",
+                code: KeyCode::Char('d'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " c 复制 ",
+                code: KeyCode::Char('c'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " / 搜索 ",
+                code: KeyCode::Char('/'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " f 发现 ",
+                code: KeyCode::Char('f'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " s 保存 ",
+                code: KeyCode::Char('s'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " v 校验 ",
+                code: KeyCode::Char('v'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " F1 帮助 ",
+                code: KeyCode::F(1),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " q 退出 ",
+                code: KeyCode::Char('q'),
+                modifiers: normal,
+                color: MUTED,
+            },
+        ]
+    } else if width >= 66 {
+        vec![
+            CommandSpec {
+                label: " n 新增 ",
+                code: KeyCode::Char('n'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " e 编辑 ",
+                code: KeyCode::Char('e'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " d 删除 ",
+                code: KeyCode::Char('d'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " / 搜索 ",
+                code: KeyCode::Char('/'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " f 发现 ",
+                code: KeyCode::Char('f'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " s 保存 ",
+                code: KeyCode::Char('s'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " F1 帮助 ",
+                code: KeyCode::F(1),
+                modifiers: normal,
+                color: MUTED,
+            },
+        ]
     } else {
-        " n 新增  e 编辑  / 搜索  s 保存  F1 帮助"
+        vec![
+            CommandSpec {
+                label: " n 新增 ",
+                code: KeyCode::Char('n'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " e 编辑 ",
+                code: KeyCode::Char('e'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " / 搜索 ",
+                code: KeyCode::Char('/'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " s 保存 ",
+                code: KeyCode::Char('s'),
+                modifiers: normal,
+                color: MUTED,
+            },
+            CommandSpec {
+                label: " F1 帮助 ",
+                code: KeyCode::F(1),
+                modifiers: normal,
+                color: MUTED,
+            },
+        ]
     };
-    let undo = match (app.can_undo(), app.can_redo()) {
-        (true, true) => "  Ctrl+Z/Y",
-        (true, false) => "  Ctrl+Z",
-        _ => "",
-    };
+    if app.can_undo() {
+        commands.push(CommandSpec {
+            label: " Ctrl+Z ",
+            code: KeyCode::Char('z'),
+            modifiers: KeyModifiers::CONTROL,
+            color: BLUE,
+        });
+    }
+    if app.can_redo() {
+        commands.push(CommandSpec {
+            label: " Ctrl+Y ",
+            code: KeyCode::Char('y'),
+            modifiers: KeyModifiers::CONTROL,
+            color: BLUE,
+        });
+    }
+    commands
+}
+
+fn draw_commands(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let line = command_specs(area.width, app)
+        .into_iter()
+        .map(|command| Span::styled(command.label, Style::default().fg(command.color)))
+        .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(command, Style::default().fg(MUTED)),
-            Span::styled(undo, Style::default().fg(BLUE)),
-        ]))
-        .style(Style::default().bg(PANEL)),
+        Paragraph::new(Line::from(line)).style(Style::default().bg(PANEL)),
         area,
     );
 }
@@ -614,6 +1369,12 @@ fn draw_help(frame: &mut Frame<'_>, terminal: Rect, scroll: usize) {
         help_row("Ctrl+K", "清空当前字段"),
         help_row("Ctrl+S", "应用表单修改"),
         help_row("Esc", "取消并关闭"),
+        Line::default(),
+        help_heading("鼠标"),
+        help_row("左键", "选择列表项、字段或底部操作"),
+        help_row("双击", "编辑提供商或模型"),
+        help_row("右键", "直接编辑列表项；枚举字段反向切换"),
+        help_row("滚轮", "移动列表选择或滚动弹窗"),
         Line::default(),
         Line::from(Span::styled(
             "保存前会校验配置。已有文件默认创建时间戳备份；密钥不会出现在详情或错误输出中。",
@@ -697,6 +1458,65 @@ fn draw_diagnostics(
     );
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ActionButton {
+    label: &'static str,
+    color: Color,
+}
+
+fn action_button_rects(area: Rect, buttons: &[ActionButton]) -> Vec<Rect> {
+    if buttons.is_empty() || area.is_empty() {
+        return Vec::new();
+    }
+    let widths = buttons
+        .iter()
+        .map(|button| button.label.width() as u16 + 4)
+        .collect::<Vec<_>>();
+    let gaps = (buttons.len().saturating_sub(1) as u16) * 2;
+    let total = widths.iter().sum::<u16>().saturating_add(gaps);
+    if total <= area.width {
+        let mut x = area.x + (area.width - total) / 2;
+        return widths
+            .into_iter()
+            .map(|width| {
+                let rect = Rect::new(x, area.y, width, 1);
+                x = x.saturating_add(width).saturating_add(2);
+                rect
+            })
+            .collect();
+    }
+
+    let width = area.width / buttons.len() as u16;
+    (0..buttons.len())
+        .map(|index| {
+            let x = area.x + width * index as u16;
+            let remaining = area.right().saturating_sub(x);
+            Rect::new(
+                x,
+                area.y,
+                if index + 1 == buttons.len() {
+                    remaining
+                } else {
+                    width
+                },
+                1,
+            )
+        })
+        .collect()
+}
+
+fn draw_action_bar(frame: &mut Frame<'_>, area: Rect, buttons: &[ActionButton]) {
+    frame.render_widget(Block::default().style(Style::default().bg(PANEL)), area);
+    for (button, rect) in buttons.iter().zip(action_button_rects(area, buttons)) {
+        frame.render_widget(
+            Paragraph::new(format!("[ {} ]", button.label))
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(button.color).bg(SURFACE)),
+            rect,
+        );
+    }
+}
+
 fn draw_templates(frame: &mut Frame<'_>, terminal: Rect, selected: usize) {
     let area = modal_rect(terminal, 72, 20, 82, 72);
     let block = modal_block(" 新增提供商 ");
@@ -730,11 +1550,19 @@ fn draw_templates(frame: &mut Frame<'_>, terminal: Rect, selected: usize) {
         rows[0],
         &mut state,
     );
-    frame.render_widget(
-        Paragraph::new("Enter 选择    Esc 取消")
-            .alignment(Alignment::Right)
-            .style(Style::default().fg(MUTED).bg(PANEL)),
+    draw_action_bar(
+        frame,
         rows[1],
+        &[
+            ActionButton {
+                label: "选择",
+                color: GREEN,
+            },
+            ActionButton {
+                label: "取消",
+                color: MUTED,
+            },
+        ],
     );
 }
 
@@ -758,15 +1586,19 @@ fn draw_confirm(frame: &mut Frame<'_>, terminal: Rect, title: &str, message: &st
             .style(Style::default().fg(TEXT).bg(PANEL)),
         rows[0],
     );
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" Enter 确认 ", Style::default().fg(BG).bg(RED)),
-            Span::raw("   "),
-            Span::styled(" Esc 取消 ", Style::default().fg(TEXT).bg(SURFACE)),
-        ]))
-        .alignment(Alignment::Center)
-        .style(Style::default().bg(PANEL)),
+    draw_action_bar(
+        frame,
         rows[1],
+        &[
+            ActionButton {
+                label: "确认",
+                color: RED,
+            },
+            ActionButton {
+                label: "取消",
+                color: MUTED,
+            },
+        ],
     );
 }
 
@@ -789,12 +1621,7 @@ fn draw_form(frame: &mut Frame<'_>, terminal: Rect, form: &FormState) {
         .split(inner);
     let field_area = rows[0];
     let visible = field_area.height as usize;
-    let mut start = form.scroll.min(form.fields.len().saturating_sub(1));
-    if form.selected < start {
-        start = form.selected;
-    } else if form.selected >= start.saturating_add(visible) {
-        start = form.selected + 1 - visible;
-    }
+    let start = form_field_start(form, visible);
     let end = (start + visible).min(form.fields.len());
     let label_width = if field_area.width >= 72 { 20 } else { 14 };
 
@@ -902,11 +1729,19 @@ fn draw_form(frame: &mut Frame<'_>, terminal: Rect, form: &FormState) {
             .style(Style::default().bg(PANEL)),
         rows[1],
     );
-    frame.render_widget(
-        Paragraph::new("Ctrl+S 应用    Tab 下一项    Esc 取消")
-            .alignment(Alignment::Right)
-            .style(Style::default().fg(MUTED).bg(PANEL)),
+    draw_action_bar(
+        frame,
         rows[2],
+        &[
+            ActionButton {
+                label: "应用",
+                color: GREEN,
+            },
+            ActionButton {
+                label: "取消",
+                color: MUTED,
+            },
+        ],
     );
 }
 
@@ -963,12 +1798,7 @@ fn draw_discovery_picker(
         .constraints([Constraint::Min(4), Constraint::Length(1)])
         .split(inner);
     let visible = rows[0].height as usize;
-    let mut effective_scroll = scroll;
-    if cursor < effective_scroll {
-        effective_scroll = cursor;
-    } else if cursor >= effective_scroll.saturating_add(visible) {
-        effective_scroll = cursor + 1 - visible;
-    }
+    let effective_scroll = discovery_view_offset(choices.len(), visible, cursor, scroll);
     let end = (effective_scroll + visible).min(choices.len());
     let items = choices[effective_scroll..end]
         .iter()
@@ -999,11 +1829,27 @@ fn draw_discovery_picker(
         &mut state,
     );
     draw_scrollbar(frame, rows[0], choices.len(), cursor);
-    frame.render_widget(
-        Paragraph::new("Space 切换  a 全选  x 清空  Enter 导入  Esc 取消")
-            .alignment(Alignment::Right)
-            .style(Style::default().fg(MUTED).bg(PANEL)),
+    draw_action_bar(
+        frame,
         rows[1],
+        &[
+            ActionButton {
+                label: "导入",
+                color: GREEN,
+            },
+            ActionButton {
+                label: "全选",
+                color: TEXT,
+            },
+            ActionButton {
+                label: "清空",
+                color: YELLOW,
+            },
+            ActionButton {
+                label: "取消",
+                color: MUTED,
+            },
+        ],
     );
 }
 
@@ -1179,6 +2025,39 @@ mod tests {
     use super::*;
     use crate::config::ConfigDocument;
 
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn mouse_app() -> App {
+        App::new(
+            ConfigDocument::from_value(
+                "/tmp/models.json",
+                json!({
+                    "providers": {
+                        "first": {
+                            "baseUrl": "http://localhost:11434/v1",
+                            "api": "openai-completions",
+                            "models": [{"id": "one"}, {"id": "two"}]
+                        },
+                        "second": {
+                            "baseUrl": "https://example.com/v1",
+                            "api": "openai-completions",
+                            "models": [{"id": "remote"}]
+                        }
+                    }
+                }),
+            ),
+            false,
+            true,
+        )
+    }
+
     #[test]
     fn truncation_respects_wide_characters() {
         assert_eq!(truncate_to_width("模型-editor", 6), "模型-…");
@@ -1189,6 +2068,127 @@ mod tests {
     fn number_formatting_adds_groups() {
         assert_eq!(format_number(128000), "128,000");
         assert_eq!(format_number(42), "42");
+    }
+
+    #[test]
+    fn mouse_selects_lists_and_applies_form_buttons() {
+        let terminal = Rect::new(0, 0, 128, 38);
+        let regions = screen_regions(terminal);
+        let workspace = workspace_regions(regions.workspace, Pane::Providers);
+        let providers = workspace.providers.unwrap();
+        let mut app = mouse_app();
+
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Right),
+                providers.x + 2,
+                providers.y + 2,
+            ),
+            terminal,
+        );
+        assert_eq!(app.provider_cursor, 1);
+        assert!(matches!(app.overlay, Some(Overlay::Form(_))));
+
+        let (form_area, auth_row, value_x) = {
+            let form = match app.overlay.as_ref().unwrap() {
+                Overlay::Form(form) => form,
+                _ => unreachable!(),
+            };
+            let preferred_height = (form.fields.len() as u16 + 7).clamp(15, 28);
+            let area = modal_rect(terminal, 98, preferred_height, 94, 92);
+            let inner = modal_block("").inner(area);
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(4),
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+            let label_width = if rows[0].width >= 72 { 20 } else { 14 };
+            (area, rows[0].y + 5, rows[0].x + label_width)
+        };
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), value_x, auth_row),
+            terminal,
+        );
+        let form = match app.overlay.as_ref().unwrap() {
+            Overlay::Form(form) => form,
+            _ => unreachable!(),
+        };
+        assert!(form.fields[5].bool_value());
+
+        let inner = modal_block("").inner(form_area);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(4),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+        let buttons = [
+            ActionButton {
+                label: "应用",
+                color: GREEN,
+            },
+            ActionButton {
+                label: "取消",
+                color: MUTED,
+            },
+        ];
+        let apply = action_button_rects(rows[2], &buttons)[0];
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), apply.x, apply.y),
+            terminal,
+        );
+        assert!(app.overlay.is_none());
+        assert_eq!(
+            app.doc.provider_value("second").unwrap()["authHeader"],
+            true
+        );
+    }
+
+    #[test]
+    fn mouse_clicks_search_and_footer_help() {
+        let terminal = Rect::new(0, 0, 128, 38);
+        let regions = screen_regions(terminal);
+        let mut app = mouse_app();
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                regions.header.x + 4,
+                regions.header.y + 2,
+            ),
+            terminal,
+        );
+        assert!(app.search_active);
+
+        app.search_active = false;
+        let commands = command_specs(regions.commands.width, &app);
+        let help_index = commands
+            .iter()
+            .position(|command| command.code == KeyCode::F(1))
+            .unwrap();
+        let x = regions.commands.x
+            + commands[..help_index]
+                .iter()
+                .map(|command| command.label.width() as u16)
+                .sum::<u16>();
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                x,
+                regions.commands.y,
+            ),
+            terminal,
+        );
+        assert!(matches!(app.overlay, Some(Overlay::Help { .. })));
     }
 
     #[test]
