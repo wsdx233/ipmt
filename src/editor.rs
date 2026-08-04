@@ -94,12 +94,20 @@ pub enum FormTarget {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormFocus {
+    Fields,
+    Confirm,
+    Cancel,
+}
+
 #[derive(Debug, Clone)]
 pub struct FormState {
     pub title: String,
     pub target: FormTarget,
     pub fields: Vec<EditorField>,
     pub selected: usize,
+    pub focus: FormFocus,
     pub cursor: usize,
     pub scroll: usize,
     pub reveal_secrets: bool,
@@ -258,6 +266,7 @@ impl FormState {
                 ),
             ],
             selected: 0,
+            focus: FormFocus::Fields,
             cursor: grapheme_count(&id),
             scroll: 0,
             reveal_secrets: false,
@@ -391,6 +400,7 @@ impl FormState {
                 ),
             ],
             selected: 0,
+            focus: FormFocus::Fields,
             cursor: grapheme_count(&id),
             scroll: 0,
             reveal_secrets: false,
@@ -406,11 +416,24 @@ impl FormState {
         &mut self.fields[self.selected]
     }
 
+    pub fn fields_focused(&self) -> bool {
+        self.focus == FormFocus::Fields
+    }
+
+    pub fn focused_button(&self) -> Option<usize> {
+        match self.focus {
+            FormFocus::Fields => None,
+            FormFocus::Confirm => Some(0),
+            FormFocus::Cancel => Some(1),
+        }
+    }
+
     pub fn mouse_select_field(&mut self, index: usize, value_column: usize) {
         if index >= self.fields.len() {
             return;
         }
         self.selected = index;
+        self.focus = FormFocus::Fields;
         self.error = None;
         let field = self.current();
         if !field.is_editable_text() {
@@ -454,8 +477,13 @@ impl FormState {
     pub fn handle_key(&mut self, event: KeyEvent) -> FormAction {
         self.error = None;
         if event.modifiers.contains(KeyModifiers::CONTROL) {
+            if event.code == KeyCode::Char('s') {
+                return FormAction::Submit;
+            }
+            if !self.fields_focused() {
+                return FormAction::None;
+            }
             match event.code {
-                KeyCode::Char('s') => return FormAction::Submit,
                 KeyCode::Char('a') => {
                     self.cursor = 0;
                     return FormAction::None;
@@ -480,29 +508,68 @@ impl FormState {
         }
 
         match event.code {
-            KeyCode::Esc => FormAction::Cancel,
+            KeyCode::Esc => return FormAction::Cancel,
+            KeyCode::Tab => {
+                self.focus_next();
+                return FormAction::None;
+            }
+            KeyCode::BackTab => {
+                self.focus_previous();
+                return FormAction::None;
+            }
+            _ => {}
+        }
+
+        if !self.fields_focused() {
+            return match event.code {
+                KeyCode::Left | KeyCode::Right => {
+                    self.focus = match self.focus {
+                        FormFocus::Confirm => FormFocus::Cancel,
+                        FormFocus::Cancel => FormFocus::Confirm,
+                        FormFocus::Fields => unreachable!(),
+                    };
+                    FormAction::None
+                }
+                KeyCode::Up => {
+                    self.focus = FormFocus::Fields;
+                    self.cursor = grapheme_count(&self.current().value);
+                    FormAction::None
+                }
+                KeyCode::Home => {
+                    self.focus = FormFocus::Confirm;
+                    FormAction::None
+                }
+                KeyCode::End => {
+                    self.focus = FormFocus::Cancel;
+                    FormAction::None
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => self.focused_button_action(),
+                _ => FormAction::None,
+            };
+        }
+
+        match event.code {
             KeyCode::F(3) => {
                 self.reveal_secrets = !self.reveal_secrets;
                 FormAction::None
             }
-            KeyCode::Tab | KeyCode::Down => {
-                self.select_next();
+            KeyCode::Down => {
+                if self.selected + 1 < self.fields.len() {
+                    self.select_next_field();
+                } else {
+                    self.focus = FormFocus::Confirm;
+                }
                 FormAction::None
             }
-            KeyCode::BackTab | KeyCode::Up => {
-                self.select_previous();
+            KeyCode::Up => {
+                self.select_previous_field();
                 FormAction::None
             }
             KeyCode::Enter => {
                 if matches!(self.current().kind, FieldKind::Bool) {
                     self.toggle_bool();
-                    FormAction::None
-                } else if self.selected + 1 == self.fields.len() {
-                    FormAction::Submit
-                } else {
-                    self.select_next();
-                    FormAction::None
                 }
+                FormAction::None
             }
             KeyCode::Char(' ') if matches!(self.current().kind, FieldKind::Bool) => {
                 self.toggle_bool();
@@ -553,7 +620,7 @@ impl FormState {
     }
 
     pub fn insert_paste(&mut self, text: &str) {
-        if !self.current().is_editable_text() {
+        if !self.fields_focused() || !self.current().is_editable_text() {
             return;
         }
         for character in text.replace(['\r', '\n'], " ").chars() {
@@ -619,17 +686,42 @@ impl FormState {
         }
     }
 
-    fn select_next(&mut self) {
+    fn focus_next(&mut self) {
+        if self.fields_focused() {
+            self.focus = FormFocus::Confirm;
+        } else {
+            self.focus = FormFocus::Fields;
+            self.cursor = grapheme_count(&self.current().value);
+        }
+    }
+
+    fn focus_previous(&mut self) {
+        if self.fields_focused() {
+            self.focus = FormFocus::Cancel;
+        } else {
+            self.focus = FormFocus::Fields;
+            self.cursor = grapheme_count(&self.current().value);
+        }
+    }
+
+    fn select_next_field(&mut self) {
         self.selected = (self.selected + 1) % self.fields.len();
         self.cursor = grapheme_count(&self.current().value);
     }
 
-    fn select_previous(&mut self) {
-        self.selected = self
-            .selected
-            .checked_sub(1)
-            .unwrap_or(self.fields.len() - 1);
-        self.cursor = grapheme_count(&self.current().value);
+    fn select_previous_field(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+            self.cursor = grapheme_count(&self.current().value);
+        }
+    }
+
+    fn focused_button_action(&self) -> FormAction {
+        match self.focus {
+            FormFocus::Confirm => FormAction::Submit,
+            FormFocus::Cancel => FormAction::Cancel,
+            FormFocus::Fields => FormAction::None,
+        }
     }
 
     fn toggle_bool(&mut self) {
@@ -978,6 +1070,53 @@ mod tests {
         };
         assert_eq!(value["cost"]["input"], 1.5);
         assert!(value["cost"]["tiers"].is_array());
+    }
+
+    #[test]
+    fn tab_switches_directly_between_fields_and_buttons() {
+        let mut form = FormState::provider(None, "provider".into(), &json!({}));
+        form.selected = 3;
+
+        form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(form.focus, FormFocus::Confirm);
+        assert_eq!(form.focused_button(), Some(0));
+
+        form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(form.focus, FormFocus::Fields);
+        assert_eq!(form.selected, 3);
+
+        form.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(form.focus, FormFocus::Cancel);
+        form.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(form.focus, FormFocus::Fields);
+        assert_eq!(form.selected, 3);
+    }
+
+    #[test]
+    fn arrow_keys_move_within_sections_and_cross_the_vertical_boundary() {
+        let mut form = FormState::provider(None, "provider".into(), &json!({}));
+        for _ in 1..form.fields.len() {
+            form.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert_eq!(form.selected, form.fields.len() - 1);
+        assert_eq!(form.focus, FormFocus::Fields);
+
+        form.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(form.focus, FormFocus::Confirm);
+        form.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(form.focus, FormFocus::Cancel);
+        assert_eq!(
+            form.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            FormAction::Cancel
+        );
+
+        form.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(form.focus, FormFocus::Fields);
+        assert_eq!(form.selected, form.fields.len() - 1);
+        let original = form.current().value.clone();
+        form.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        form.insert_paste("must-not-be-inserted");
+        assert_eq!(form.current().value, original);
     }
 
     #[test]

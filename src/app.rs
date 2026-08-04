@@ -58,6 +58,12 @@ pub struct DiscoveryChoice {
     pub exists: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogFocus {
+    Content,
+    Actions(usize),
+}
+
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
     DeleteProvider {
@@ -83,11 +89,13 @@ pub enum Overlay {
     },
     Templates {
         selected: usize,
+        focus: DialogFocus,
     },
     Confirm {
         title: String,
         message: String,
         action: ConfirmAction,
+        selected_button: usize,
     },
     Form(FormState),
     DiscoveryLoading {
@@ -98,6 +106,7 @@ pub enum Overlay {
         choices: Vec<DiscoveryChoice>,
         cursor: usize,
         scroll: usize,
+        focus: DialogFocus,
     },
 }
 
@@ -327,6 +336,7 @@ impl App {
                     choices,
                     cursor: 0,
                     scroll: 0,
+                    focus: DialogFocus::Content,
                 });
                 self.set_status(StatusKind::Success, format!("发现 {count} 个模型"));
             }
@@ -371,6 +381,11 @@ impl App {
         } else {
             self.last_list_click = Some((pane, index, now));
         }
+    }
+
+    pub fn mouse_focus_pane(&mut self, pane: Pane) {
+        self.focus = pane;
+        self.last_list_click = None;
     }
 
     pub fn mouse_scroll_list(&mut self, pane: Pane, amount: isize) {
@@ -544,34 +559,104 @@ impl App {
                 }
                 _ => self.overlay = Some(Overlay::Diagnostics { scroll }),
             },
-            Overlay::Templates { mut selected } => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {}
-                KeyCode::Up | KeyCode::Char('k') => {
-                    selected = selected.saturating_sub(1);
-                    self.overlay = Some(Overlay::Templates { selected });
+            Overlay::Templates {
+                mut selected,
+                mut focus,
+            } => {
+                let mut keep_open = true;
+                match focus {
+                    DialogFocus::Content => match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => keep_open = false,
+                        KeyCode::Tab => focus = DialogFocus::Actions(0),
+                        KeyCode::BackTab => focus = DialogFocus::Actions(1),
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            selected = selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if selected + 1 < PROVIDER_TEMPLATES.len() {
+                                selected += 1;
+                            } else {
+                                focus = DialogFocus::Actions(0);
+                            }
+                        }
+                        KeyCode::PageUp => selected = selected.saturating_sub(5),
+                        KeyCode::PageDown => {
+                            selected = (selected + 5).min(PROVIDER_TEMPLATES.len() - 1);
+                        }
+                        KeyCode::Home | KeyCode::Char('g') => selected = 0,
+                        KeyCode::End | KeyCode::Char('G') => {
+                            selected = PROVIDER_TEMPLATES.len() - 1;
+                        }
+                        _ => {}
+                    },
+                    DialogFocus::Actions(mut button) => match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => keep_open = false,
+                        KeyCode::Tab | KeyCode::BackTab | KeyCode::Up => {
+                            focus = DialogFocus::Content;
+                        }
+                        KeyCode::Left => {
+                            button = button.saturating_sub(1);
+                            focus = DialogFocus::Actions(button);
+                        }
+                        KeyCode::Right => {
+                            button = (button + 1).min(1);
+                            focus = DialogFocus::Actions(button);
+                        }
+                        KeyCode::Home => focus = DialogFocus::Actions(0),
+                        KeyCode::End => focus = DialogFocus::Actions(1),
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            if button == 0 {
+                                self.new_provider_from_template(PROVIDER_TEMPLATES[selected]);
+                                return;
+                            }
+                            keep_open = false;
+                        }
+                        _ => {}
+                    },
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    selected = (selected + 1).min(PROVIDER_TEMPLATES.len() - 1);
-                    self.overlay = Some(Overlay::Templates { selected });
+                if keep_open {
+                    self.overlay = Some(Overlay::Templates { selected, focus });
                 }
-                KeyCode::Enter => self.new_provider_from_template(PROVIDER_TEMPLATES[selected]),
-                _ => self.overlay = Some(Overlay::Templates { selected }),
-            },
+            }
             Overlay::Confirm {
                 title,
                 message,
                 action,
-            } => match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => self.execute_confirm(action),
-                KeyCode::Char('n') | KeyCode::Esc => {}
-                _ => {
+                mut selected_button,
+            } => {
+                let mut keep_open = true;
+                match key.code {
+                    KeyCode::Char('y') => {
+                        self.execute_confirm(action);
+                        return;
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => keep_open = false,
+                    KeyCode::Left | KeyCode::BackTab => {
+                        selected_button = selected_button.saturating_sub(1);
+                    }
+                    KeyCode::Right | KeyCode::Tab => {
+                        selected_button = (selected_button + 1).min(1);
+                    }
+                    KeyCode::Home => selected_button = 0,
+                    KeyCode::End => selected_button = 1,
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        if selected_button == 0 {
+                            self.execute_confirm(action);
+                            return;
+                        }
+                        keep_open = false;
+                    }
+                    _ => {}
+                }
+                if keep_open {
                     self.overlay = Some(Overlay::Confirm {
                         title,
                         message,
                         action,
+                        selected_button,
                     });
                 }
-            },
+            }
             Overlay::Form(mut form) => match form.handle_key(key) {
                 FormAction::None => self.overlay = Some(Overlay::Form(form)),
                 FormAction::Cancel => {}
@@ -595,53 +680,98 @@ impl App {
                 mut choices,
                 mut cursor,
                 mut scroll,
+                mut focus,
             } => {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => return,
-                    KeyCode::Up | KeyCode::Char('k') => cursor = cursor.saturating_sub(1),
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        cursor = (cursor + 1).min(choices.len().saturating_sub(1));
-                    }
-                    KeyCode::PageUp => cursor = cursor.saturating_sub(10),
-                    KeyCode::PageDown => {
-                        cursor = (cursor + 10).min(choices.len().saturating_sub(1));
-                    }
-                    KeyCode::Home | KeyCode::Char('g') => cursor = 0,
-                    KeyCode::End | KeyCode::Char('G') => {
-                        cursor = choices.len().saturating_sub(1);
-                    }
-                    KeyCode::Char(' ') => {
-                        if let Some(choice) = choices.get_mut(cursor)
-                            && !choice.exists
-                        {
-                            choice.selected = !choice.selected;
+                let mut keep_open = true;
+                match focus {
+                    DialogFocus::Content => match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => keep_open = false,
+                        KeyCode::Tab => focus = DialogFocus::Actions(0),
+                        KeyCode::BackTab => focus = DialogFocus::Actions(3),
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            cursor = cursor.saturating_sub(1);
                         }
-                    }
-                    KeyCode::Char('a') => {
-                        for choice in &mut choices {
-                            choice.selected = !choice.exists;
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if cursor + 1 < choices.len() {
+                                cursor += 1;
+                            } else {
+                                focus = DialogFocus::Actions(0);
+                            }
                         }
-                    }
-                    KeyCode::Char('x') => {
-                        for choice in &mut choices {
-                            choice.selected = false;
+                        KeyCode::PageUp => cursor = cursor.saturating_sub(10),
+                        KeyCode::PageDown => {
+                            cursor = (cursor + 10).min(choices.len().saturating_sub(1));
                         }
-                    }
-                    KeyCode::Enter => {
-                        self.import_discovered(&provider_id, &choices);
-                        return;
-                    }
-                    _ => {}
+                        KeyCode::Home | KeyCode::Char('g') => cursor = 0,
+                        KeyCode::End | KeyCode::Char('G') => {
+                            cursor = choices.len().saturating_sub(1);
+                        }
+                        KeyCode::Char(' ') => {
+                            if let Some(choice) = choices.get_mut(cursor)
+                                && !choice.exists
+                            {
+                                choice.selected = !choice.selected;
+                            }
+                        }
+                        KeyCode::Char('a') => {
+                            for choice in &mut choices {
+                                choice.selected = !choice.exists;
+                            }
+                        }
+                        KeyCode::Char('x') => {
+                            for choice in &mut choices {
+                                choice.selected = false;
+                            }
+                        }
+                        _ => {}
+                    },
+                    DialogFocus::Actions(mut button) => match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => keep_open = false,
+                        KeyCode::Tab | KeyCode::BackTab | KeyCode::Up => {
+                            focus = DialogFocus::Content;
+                        }
+                        KeyCode::Left => {
+                            button = button.saturating_sub(1);
+                            focus = DialogFocus::Actions(button);
+                        }
+                        KeyCode::Right => {
+                            button = (button + 1).min(3);
+                            focus = DialogFocus::Actions(button);
+                        }
+                        KeyCode::Home => focus = DialogFocus::Actions(0),
+                        KeyCode::End => focus = DialogFocus::Actions(3),
+                        KeyCode::Enter | KeyCode::Char(' ') => match button {
+                            0 => {
+                                self.import_discovered(&provider_id, &choices);
+                                return;
+                            }
+                            1 => {
+                                for choice in &mut choices {
+                                    choice.selected = !choice.exists;
+                                }
+                            }
+                            2 => {
+                                for choice in &mut choices {
+                                    choice.selected = false;
+                                }
+                            }
+                            _ => keep_open = false,
+                        },
+                        _ => {}
+                    },
                 }
                 if cursor < scroll {
                     scroll = cursor;
                 }
-                self.overlay = Some(Overlay::DiscoveryPicker {
-                    provider_id,
-                    choices,
-                    cursor,
-                    scroll,
-                });
+                if keep_open {
+                    self.overlay = Some(Overlay::DiscoveryPicker {
+                        provider_id,
+                        choices,
+                        cursor,
+                        scroll,
+                        focus,
+                    });
+                }
             }
         }
     }
@@ -734,7 +864,10 @@ impl App {
 
     fn open_templates(&mut self) {
         if self.ensure_writable() {
-            self.overlay = Some(Overlay::Templates { selected: 0 });
+            self.overlay = Some(Overlay::Templates {
+                selected: 0,
+                focus: DialogFocus::Content,
+            });
         }
     }
 
@@ -858,6 +991,7 @@ impl App {
                     action: ConfirmAction::DeleteProvider {
                         provider_id: provider.summary.id,
                     },
+                    selected_button: 0,
                 });
             }
             Pane::Models => {
@@ -874,6 +1008,7 @@ impl App {
                         model_index: model.source_index,
                         model_id: model.summary.id,
                     },
+                    selected_button: 0,
                 });
             }
         }
@@ -1053,6 +1188,7 @@ impl App {
                 title: "放弃未保存更改".into(),
                 message: "退出后，本次尚未保存的修改会丢失。".into(),
                 action: ConfirmAction::Quit,
+                selected_button: 0,
             });
         } else {
             self.should_quit = true;
@@ -1065,6 +1201,7 @@ impl App {
                 title: "重新载入配置".into(),
                 message: "重新载入会放弃当前未保存的修改。".into(),
                 action: ConfirmAction::Reload,
+                selected_button: 0,
             });
         } else {
             self.reload();
@@ -1121,6 +1258,7 @@ impl App {
                     title: "磁盘文件已变化".into(),
                     message: "文件在载入后被其他程序修改。强制保存会先备份当前磁盘版本。".into(),
                     action: ConfirmAction::ForceSave,
+                    selected_button: 0,
                 });
             }
             Err(error) => self.set_status(StatusKind::Error, error.to_string()),
@@ -1291,6 +1429,10 @@ mod tests {
     use super::*;
     use crate::config::ConfigDocument;
 
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
     fn app() -> App {
         App::new(
             ConfigDocument::from_value(
@@ -1361,6 +1503,91 @@ mod tests {
         app.model_cursor = 0;
         app.mouse_scroll_list(Pane::Models, 3);
         assert_eq!(app.model_cursor, 1);
+    }
+
+    #[test]
+    fn template_dialog_switches_between_content_and_actions() {
+        let mut app = app();
+        app.open_templates();
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Templates {
+                focus: DialogFocus::Content,
+                ..
+            })
+        ));
+
+        press(&mut app, KeyCode::Tab);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Templates {
+                focus: DialogFocus::Actions(0),
+                ..
+            })
+        ));
+        press(&mut app, KeyCode::Right);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Templates {
+                focus: DialogFocus::Actions(1),
+                ..
+            })
+        ));
+        press(&mut app, KeyCode::Up);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Templates {
+                focus: DialogFocus::Content,
+                ..
+            })
+        ));
+
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Down);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Templates {
+                focus: DialogFocus::Actions(0),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn discovery_dialog_actions_use_horizontal_focus() {
+        let mut app = app();
+        app.overlay = Some(Overlay::DiscoveryPicker {
+            provider_id: "alpha".into(),
+            choices: vec![DiscoveryChoice {
+                model: DiscoveredModel {
+                    id: "new-model".into(),
+                    name: None,
+                },
+                selected: false,
+                exists: false,
+            }],
+            cursor: 0,
+            scroll: 0,
+            focus: DialogFocus::Content,
+        });
+
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Enter);
+        let Some(Overlay::DiscoveryPicker { choices, focus, .. }) = &app.overlay else {
+            panic!("discovery picker should remain open")
+        };
+        assert!(choices[0].selected);
+        assert_eq!(*focus, DialogFocus::Actions(1));
+
+        press(&mut app, KeyCode::Tab);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::DiscoveryPicker {
+                focus: DialogFocus::Content,
+                ..
+            })
+        ));
     }
 
     #[test]

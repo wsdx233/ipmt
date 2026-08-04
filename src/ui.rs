@@ -15,7 +15,7 @@ use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Overlay, Pane, StatusKind};
+use crate::app::{App, DialogFocus, Overlay, Pane, StatusKind};
 use crate::config::{CredentialHint, Diagnostic, Severity};
 use crate::editor::{FieldKind, FormState, PROVIDER_TEMPLATES};
 
@@ -130,6 +130,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
 #[derive(Debug, Clone, Copy)]
 enum MouseAction {
     Key(KeyCode, KeyModifiers),
+    ActivateDialogButton(usize),
+    FocusPane(Pane),
     SelectList {
         pane: Pane,
         index: usize,
@@ -217,33 +219,39 @@ fn base_mouse_action(app: &App, event: MouseEvent, terminal: Rect) -> Option<Mou
             }
             if let Some(area) = workspace.providers
                 && area.contains(point)
-                && let Some(index) = list_index_at(
+            {
+                return if let Some(index) = list_index_at(
                     app.visible_providers().len(),
                     area,
                     app.provider_cursor,
                     event.row,
-                )
-            {
-                return Some(MouseAction::SelectList {
-                    pane: Pane::Providers,
-                    index,
-                    activate: button == MouseButton::Right,
-                });
+                ) {
+                    Some(MouseAction::SelectList {
+                        pane: Pane::Providers,
+                        index,
+                        activate: button == MouseButton::Right,
+                    })
+                } else {
+                    Some(MouseAction::FocusPane(Pane::Providers))
+                };
             }
             if let Some(area) = workspace.models
                 && area.contains(point)
-                && let Some(index) = list_index_at(
+            {
+                return if let Some(index) = list_index_at(
                     app.visible_models().len(),
                     area,
                     app.model_cursor,
                     event.row,
-                )
-            {
-                return Some(MouseAction::SelectList {
-                    pane: Pane::Models,
-                    index,
-                    activate: button == MouseButton::Right,
-                });
+                ) {
+                    Some(MouseAction::SelectList {
+                        pane: Pane::Models,
+                        index,
+                        activate: button == MouseButton::Right,
+                    })
+                } else {
+                    Some(MouseAction::FocusPane(Pane::Models))
+                };
             }
         }
         _ => {}
@@ -287,7 +295,7 @@ fn overlay_mouse_action(app: &App, event: MouseEvent, terminal: Rect) -> Option<
                 return Some(MouseAction::Key(KeyCode::Esc, KeyModifiers::NONE));
             }
         }
-        Overlay::Templates { selected } => {
+        Overlay::Templates { selected, .. } => {
             let area = modal_rect(terminal, 72, 20, 82, 72);
             if let Some(amount) = scroll
                 && area.contains(point)
@@ -311,14 +319,7 @@ fn overlay_mouse_action(app: &App, event: MouseEvent, terminal: Rect) -> Option<
                     },
                 ];
                 if let Some(index) = action_button_at(rows[1], &buttons, point) {
-                    return Some(MouseAction::Key(
-                        if index == 0 {
-                            KeyCode::Enter
-                        } else {
-                            KeyCode::Esc
-                        },
-                        KeyModifiers::NONE,
-                    ));
+                    return Some(MouseAction::ActivateDialogButton(index));
                 }
                 if rows[0].contains(point) {
                     let visible = (rows[0].height as usize / 2).max(1);
@@ -353,14 +354,7 @@ fn overlay_mouse_action(app: &App, event: MouseEvent, terminal: Rect) -> Option<
                     },
                 ];
                 if let Some(index) = action_button_at(rows[1], &buttons, point) {
-                    return Some(MouseAction::Key(
-                        if index == 0 {
-                            KeyCode::Enter
-                        } else {
-                            KeyCode::Esc
-                        },
-                        KeyModifiers::NONE,
-                    ));
+                    return Some(MouseAction::ActivateDialogButton(index));
                 }
                 if !area.contains(point) {
                     return Some(MouseAction::Key(KeyCode::Esc, KeyModifiers::NONE));
@@ -387,7 +381,7 @@ fn overlay_mouse_action(app: &App, event: MouseEvent, terminal: Rect) -> Option<
                     .split(inner);
                 let buttons = [
                     ActionButton {
-                        label: "应用",
+                        label: "确定",
                         color: GREEN,
                     },
                     ActionButton {
@@ -417,14 +411,16 @@ fn overlay_mouse_action(app: &App, event: MouseEvent, terminal: Rect) -> Option<
                         let label_width = label_width.min(rows[0].width.saturating_sub(4));
                         let value_x = rows[0].x.saturating_add(label_width);
                         let value_width = rows[0].right().saturating_sub(value_x);
-                        let horizontal_scroll =
-                            if index == form.selected && form.fields[index].is_editable_text() {
-                                let available = value_width.saturating_sub(1) as usize;
-                                form.cursor_display_width()
-                                    .saturating_sub(available.saturating_sub(1))
-                            } else {
-                                0
-                            };
+                        let horizontal_scroll = if form.fields_focused()
+                            && index == form.selected
+                            && form.fields[index].is_editable_text()
+                        {
+                            let available = value_width.saturating_sub(1) as usize;
+                            form.cursor_display_width()
+                                .saturating_sub(available.saturating_sub(1))
+                        } else {
+                            0
+                        };
                         let value_column = (event.column.saturating_sub(value_x) as usize)
                             .saturating_add(horizontal_scroll);
                         let activate = (event.column >= value_x)
@@ -484,13 +480,7 @@ fn overlay_mouse_action(app: &App, event: MouseEvent, terminal: Rect) -> Option<
                     },
                 ];
                 if let Some(index) = action_button_at(rows[1], &buttons, point) {
-                    let code = match index {
-                        0 => KeyCode::Enter,
-                        1 => KeyCode::Char('a'),
-                        2 => KeyCode::Char('x'),
-                        _ => KeyCode::Esc,
-                    };
-                    return Some(MouseAction::Key(code, KeyModifiers::NONE));
+                    return Some(MouseAction::ActivateDialogButton(index));
                 }
                 if rows[0].contains(point) {
                     let start = discovery_view_offset(
@@ -518,6 +508,29 @@ fn apply_mouse_action(app: &mut App, action: MouseAction) {
         MouseAction::Key(code, modifiers) => {
             app.handle_event(Event::Key(KeyEvent::new(code, modifiers)));
         }
+        MouseAction::ActivateDialogButton(index) => {
+            let activated = match app.overlay.as_mut() {
+                Some(Overlay::Templates { focus, .. })
+                | Some(Overlay::DiscoveryPicker { focus, .. }) => {
+                    *focus = DialogFocus::Actions(index);
+                    true
+                }
+                Some(Overlay::Confirm {
+                    selected_button, ..
+                }) => {
+                    *selected_button = index;
+                    true
+                }
+                _ => false,
+            };
+            if activated {
+                app.handle_event(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )));
+            }
+        }
+        MouseAction::FocusPane(pane) => app.mouse_focus_pane(pane),
         MouseAction::SelectList {
             pane,
             index,
@@ -527,8 +540,16 @@ fn apply_mouse_action(app: &mut App, action: MouseAction) {
         MouseAction::ActivateSearch => app.mouse_activate_search(),
         MouseAction::ClearSearch => app.mouse_clear_search(),
         MouseAction::SelectTemplate { index, activate } => {
-            if let Some(Overlay::Templates { selected }) = app.overlay.as_mut() {
+            if let Some(Overlay::Templates {
+                selected, focus, ..
+            }) = app.overlay.as_mut()
+            {
                 *selected = index;
+                *focus = if activate {
+                    DialogFocus::Actions(0)
+                } else {
+                    DialogFocus::Content
+                };
             }
             if activate {
                 app.handle_event(Event::Key(KeyEvent::new(
@@ -554,10 +575,12 @@ fn apply_mouse_action(app: &mut App, action: MouseAction) {
                 choices,
                 cursor,
                 scroll,
+                focus,
                 ..
             }) = app.overlay.as_mut()
             {
                 *cursor = index;
+                *focus = DialogFocus::Content;
                 if index < *scroll {
                     *scroll = index;
                 }
@@ -578,8 +601,11 @@ fn scroll_overlay(app: &mut App, amount: isize) {
         Some(Overlay::Help { scroll }) | Some(Overlay::Diagnostics { scroll }) => {
             *scroll = move_index(*scroll, amount, usize::MAX);
         }
-        Some(Overlay::Templates { selected }) => {
+        Some(Overlay::Templates {
+            selected, focus, ..
+        }) => {
             *selected = move_index(*selected, amount.signum(), PROVIDER_TEMPLATES.len() - 1);
+            *focus = DialogFocus::Content;
         }
         Some(Overlay::Form(form)) => {
             let selected = move_index(
@@ -593,9 +619,11 @@ fn scroll_overlay(app: &mut App, amount: isize) {
             choices,
             cursor,
             scroll,
+            focus,
             ..
         }) => {
             *cursor = move_index(*cursor, amount, choices.len().saturating_sub(1));
+            *focus = DialogFocus::Content;
             if *cursor < *scroll {
                 *scroll = *cursor;
             }
@@ -1321,8 +1349,15 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App, overlay: &Overlay, terminal: R
         Overlay::Diagnostics { scroll } => {
             draw_diagnostics(frame, terminal, &app.diagnostics(), *scroll)
         }
-        Overlay::Templates { selected } => draw_templates(frame, terminal, *selected),
-        Overlay::Confirm { title, message, .. } => draw_confirm(frame, terminal, title, message),
+        Overlay::Templates { selected, focus } => {
+            draw_templates(frame, terminal, *selected, *focus)
+        }
+        Overlay::Confirm {
+            title,
+            message,
+            selected_button,
+            ..
+        } => draw_confirm(frame, terminal, title, message, *selected_button),
         Overlay::Form(form) => draw_form(frame, terminal, form),
         Overlay::DiscoveryLoading { provider_id } => draw_loading(frame, terminal, provider_id),
         Overlay::DiscoveryPicker {
@@ -1330,7 +1365,16 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App, overlay: &Overlay, terminal: R
             choices,
             cursor,
             scroll,
-        } => draw_discovery_picker(frame, terminal, provider_id, choices, *cursor, *scroll),
+            focus,
+        } => draw_discovery_picker(
+            frame,
+            terminal,
+            provider_id,
+            choices,
+            *cursor,
+            *scroll,
+            *focus,
+        ),
     }
 }
 
@@ -1361,9 +1405,11 @@ fn draw_help(frame: &mut Frame<'_>, terminal: Rect, scroll: usize) {
         help_row("v", "查看全部校验结果"),
         help_row("f", "从当前提供商发现远程模型"),
         Line::default(),
-        help_heading("表单"),
-        help_row("Tab / Shift+Tab", "切换字段"),
-        help_row("← / →", "选择枚举值或移动光标"),
+        help_heading("弹窗焦点"),
+        help_row("Tab / Shift+Tab", "直接切换内容区与按钮区"),
+        help_row("↑ / ↓", "移动内容项；末项向下进入按钮区"),
+        help_row("← / →", "切换枚举值或下方按钮"),
+        help_row("Enter / Space", "激活当前开关、选项或按钮"),
         help_row("Space", "切换开关"),
         help_row("F3", "临时显示 / 隐藏密钥"),
         help_row("Ctrl+K", "清空当前字段"),
@@ -1505,19 +1551,36 @@ fn action_button_rects(area: Rect, buttons: &[ActionButton]) -> Vec<Rect> {
         .collect()
 }
 
-fn draw_action_bar(frame: &mut Frame<'_>, area: Rect, buttons: &[ActionButton]) {
+fn draw_action_bar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    buttons: &[ActionButton],
+    focused: Option<usize>,
+) {
     frame.render_widget(Block::default().style(Style::default().bg(PANEL)), area);
-    for (button, rect) in buttons.iter().zip(action_button_rects(area, buttons)) {
+    for (index, (button, rect)) in buttons
+        .iter()
+        .zip(action_button_rects(area, buttons))
+        .enumerate()
+    {
+        let style = if focused == Some(index) {
+            Style::default()
+                .fg(BG)
+                .bg(button.color)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(button.color).bg(SURFACE)
+        };
         frame.render_widget(
             Paragraph::new(format!("[ {} ]", button.label))
                 .alignment(Alignment::Center)
-                .style(Style::default().fg(button.color).bg(SURFACE)),
+                .style(style),
             rect,
         );
     }
 }
 
-fn draw_templates(frame: &mut Frame<'_>, terminal: Rect, selected: usize) {
+fn draw_templates(frame: &mut Frame<'_>, terminal: Rect, selected: usize, focus: DialogFocus) {
     let area = modal_rect(terminal, 72, 20, 82, 72);
     let block = modal_block(" 新增提供商 ");
     let inner = block.inner(area);
@@ -1544,9 +1607,15 @@ fn draw_templates(frame: &mut Frame<'_>, terminal: Rect, selected: usize) {
         .collect::<Vec<_>>();
     let mut state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(
-        List::new(items)
-            .highlight_symbol("> ")
-            .highlight_style(Style::default().fg(CYAN).bg(SURFACE)),
+        List::new(items).highlight_symbol("> ").highlight_style(
+            Style::default()
+                .fg(if focus == DialogFocus::Content {
+                    CYAN
+                } else {
+                    MUTED
+                })
+                .bg(SURFACE),
+        ),
         rows[0],
         &mut state,
     );
@@ -1563,10 +1632,20 @@ fn draw_templates(frame: &mut Frame<'_>, terminal: Rect, selected: usize) {
                 color: MUTED,
             },
         ],
+        match focus {
+            DialogFocus::Content => None,
+            DialogFocus::Actions(button) => Some(button),
+        },
     );
 }
 
-fn draw_confirm(frame: &mut Frame<'_>, terminal: Rect, title: &str, message: &str) {
+fn draw_confirm(
+    frame: &mut Frame<'_>,
+    terminal: Rect,
+    title: &str,
+    message: &str,
+    selected_button: usize,
+) {
     let width = (message.width() as u16 + 8).clamp(44, 76);
     let area = modal_rect(terminal, width, 9, 90, 60);
     let block_title = format!(" {title} ");
@@ -1599,6 +1678,7 @@ fn draw_confirm(frame: &mut Frame<'_>, terminal: Rect, title: &str, message: &st
                 color: MUTED,
             },
         ],
+        Some(selected_button),
     );
 }
 
@@ -1632,7 +1712,7 @@ fn draw_form(frame: &mut Frame<'_>, terminal: Rect, form: &FormState) {
             field_area.width,
             1,
         );
-        let selected = start + row_offset == form.selected;
+        let selected = form.fields_focused() && start + row_offset == form.selected;
         let row_style = if selected {
             Style::default().fg(TEXT).bg(SURFACE)
         } else {
@@ -1705,6 +1785,27 @@ fn draw_form(frame: &mut Frame<'_>, terminal: Rect, form: &FormState) {
                 Style::default().fg(MUTED),
             )),
         ]
+    } else if let Some(button) = form.focused_button() {
+        let (message, hint, color) = if button == 0 {
+            (
+                "确定并应用修改",
+                "左右键选择按钮，Tab 或向上返回字段区",
+                GREEN,
+            )
+        } else {
+            (
+                "取消本次编辑",
+                "左右键选择按钮，Tab 或向上返回字段区",
+                YELLOW,
+            )
+        };
+        vec![
+            Line::from(Span::styled(
+                message,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(hint, Style::default().fg(MUTED))),
+        ]
     } else {
         vec![
             Line::from(Span::styled(
@@ -1734,7 +1835,7 @@ fn draw_form(frame: &mut Frame<'_>, terminal: Rect, form: &FormState) {
         rows[2],
         &[
             ActionButton {
-                label: "应用",
+                label: "确定",
                 color: GREEN,
             },
             ActionButton {
@@ -1742,6 +1843,7 @@ fn draw_form(frame: &mut Frame<'_>, terminal: Rect, form: &FormState) {
                 color: MUTED,
             },
         ],
+        form.focused_button(),
     );
 }
 
@@ -1784,6 +1886,7 @@ fn draw_discovery_picker(
     choices: &[crate::app::DiscoveryChoice],
     cursor: usize,
     scroll: usize,
+    focus: DialogFocus,
 ) {
     let area = modal_rect(terminal, 88, 28, 92, 88);
     let selected = choices.iter().filter(|item| item.selected).count();
@@ -1822,9 +1925,15 @@ fn draw_discovery_picker(
     let local_cursor = cursor.saturating_sub(effective_scroll);
     let mut state = ListState::default().with_selected(Some(local_cursor));
     frame.render_stateful_widget(
-        List::new(items)
-            .highlight_symbol("> ")
-            .highlight_style(Style::default().fg(CYAN).bg(SURFACE)),
+        List::new(items).highlight_symbol("> ").highlight_style(
+            Style::default()
+                .fg(if focus == DialogFocus::Content {
+                    CYAN
+                } else {
+                    MUTED
+                })
+                .bg(SURFACE),
+        ),
         rows[0],
         &mut state,
     );
@@ -1850,6 +1959,10 @@ fn draw_discovery_picker(
                 color: MUTED,
             },
         ],
+        match focus {
+            DialogFocus::Content => None,
+            DialogFocus::Actions(button) => Some(button),
+        },
     );
 }
 
@@ -2131,7 +2244,7 @@ mod tests {
             .split(inner);
         let buttons = [
             ActionButton {
-                label: "应用",
+                label: "确定",
                 color: GREEN,
             },
             ActionButton {
@@ -2189,6 +2302,40 @@ mod tests {
             terminal,
         );
         assert!(matches!(app.overlay, Some(Overlay::Help { .. })));
+    }
+
+    #[test]
+    fn clicking_empty_list_background_switches_panel_focus() {
+        let terminal = Rect::new(0, 0, 128, 38);
+        let regions = screen_regions(terminal);
+        let workspace = workspace_regions(regions.workspace, Pane::Providers);
+        let providers = workspace.providers.unwrap();
+        let models = workspace.models.unwrap();
+        let mut app = mouse_app();
+
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                models.x + 3,
+                models.y + 10,
+            ),
+            terminal,
+        );
+        assert_eq!(app.focus, Pane::Models);
+        assert_eq!(app.model_cursor, 0);
+
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                providers.x + 3,
+                providers.y + 10,
+            ),
+            terminal,
+        );
+        assert_eq!(app.focus, Pane::Providers);
+        assert_eq!(app.provider_cursor, 0);
     }
 
     #[test]
