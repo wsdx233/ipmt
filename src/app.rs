@@ -615,6 +615,10 @@ impl App {
                 match focus {
                     DialogFocus::Content => match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => keep_open = false,
+                        KeyCode::Enter => {
+                            self.new_provider_from_template(PROVIDER_TEMPLATES[selected]);
+                            return;
+                        }
                         KeyCode::Tab => focus = DialogFocus::Actions(0),
                         KeyCode::BackTab => focus = DialogFocus::Actions(1),
                         KeyCode::Up | KeyCode::Char('k') => {
@@ -765,6 +769,10 @@ impl App {
                     match focus {
                         DialogFocus::Content => match key.code {
                             KeyCode::Esc | KeyCode::Char('q') => keep_open = false,
+                            KeyCode::Enter => {
+                                self.import_discovered(&provider_id, &choices);
+                                return;
+                            }
                             KeyCode::Char('/') => filter_active = true,
                             KeyCode::Tab => focus = DialogFocus::Actions(0),
                             KeyCode::BackTab => focus = DialogFocus::Actions(3),
@@ -1884,6 +1892,18 @@ mod tests {
     }
 
     #[test]
+    fn enter_directly_chooses_provider_template() {
+        let mut app = app();
+        app.open_templates();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        let Some(Overlay::Form(form)) = &app.overlay else {
+            panic!("Enter on template content should open the provider form")
+        };
+        assert!(form.title.contains("新增提供商"));
+    }
+
+    #[test]
     fn discovery_dialog_actions_use_horizontal_focus() {
         let mut app = app();
         app.overlay = Some(Overlay::DiscoveryPicker {
@@ -1982,6 +2002,38 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn enter_directly_imports_discovery_selection() {
+        let mut app = app();
+        app.overlay = Some(Overlay::DiscoveryPicker {
+            provider_id: "alpha".into(),
+            choices: vec![DiscoveryChoice {
+                model: DiscoveredModel {
+                    id: "direct-import".into(),
+                    name: None,
+                    config: None,
+                },
+                selected: true,
+                exists: false,
+            }],
+            filtered: vec![0],
+            query: String::new(),
+            filter_active: false,
+            cursor: 0,
+            scroll: 0,
+            focus: DialogFocus::Content,
+        });
+
+        press(&mut app, KeyCode::Enter);
+        assert!(app.overlay.is_none());
+        assert!(
+            app.doc
+                .models("alpha")
+                .iter()
+                .any(|model| model.id == "direct-import")
+        );
     }
 
     #[test]
