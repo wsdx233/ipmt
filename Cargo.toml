@@ -16,9 +16,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 thiserror = "2.0"
+tempfile = "3.20"
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
 url = "2.5"
-
-[dev-dependencies]
-tempfile = "3.20"

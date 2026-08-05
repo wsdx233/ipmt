@@ -17,6 +17,7 @@ use crate::editor::{
     provider_template,
 };
 use crate::known_models::{KnownModel, fetch_known_models};
+use crate::model_test::{ModelTestResult, test_model};
 
 const HISTORY_LIMIT: usize = 100;
 
@@ -130,6 +131,17 @@ pub enum Overlay {
         scroll: usize,
         focus: DialogFocus,
     },
+    ModelTestLoading {
+        provider_id: String,
+        model_id: String,
+    },
+    ModelTestResult {
+        provider_id: String,
+        model_id: String,
+        success: bool,
+        output: String,
+        scroll: usize,
+    },
 }
 
 struct DiscoveryResult {
@@ -139,6 +151,12 @@ struct DiscoveryResult {
 
 struct KnownModelsResult {
     result: Result<Vec<KnownModel>, String>,
+}
+
+struct ModelTestMessage {
+    provider_id: String,
+    model_id: String,
+    result: ModelTestResult,
 }
 
 pub struct App {
@@ -160,6 +178,7 @@ pub struct App {
     known_models_rx: Option<Receiver<KnownModelsResult>>,
     known_models: Option<Vec<KnownModel>>,
     known_models_pending_provider: Option<String>,
+    model_test_rx: Option<Receiver<ModelTestMessage>>,
     last_list_click: Option<(Pane, usize, Instant)>,
 }
 
@@ -201,6 +220,7 @@ impl App {
             known_models_rx: None,
             known_models: None,
             known_models_pending_provider: None,
+            model_test_rx: None,
             last_list_click: None,
         };
         app.normalize_selection();
@@ -333,6 +353,7 @@ impl App {
 
     pub fn poll_background(&mut self) {
         self.poll_known_models();
+        self.poll_model_test();
         let result = match self.discovery_rx.as_ref().map(Receiver::try_recv) {
             Some(Ok(result)) => Some(result),
             Some(Err(TryRecvError::Disconnected)) => {
@@ -533,6 +554,7 @@ impl App {
             KeyCode::Char('p') => self.open_templates(),
             KeyCode::Char('m') => self.new_model(),
             KeyCode::Char('i') if self.focus == Pane::Models => self.start_known_models(),
+            KeyCode::Char('t') if self.focus == Pane::Models => self.start_model_test(),
             KeyCode::Char('d') | KeyCode::Delete => self.confirm_delete(),
             KeyCode::Char('c') => self.duplicate_selected(),
             KeyCode::Char('f') => self.start_discovery(),
@@ -968,6 +990,87 @@ impl App {
                     });
                 }
             }
+            Overlay::ModelTestLoading {
+                provider_id,
+                model_id,
+            } => {
+                if key.code == KeyCode::Esc {
+                    self.model_test_rx = None;
+                    self.set_status(StatusKind::Warning, "已忽略模型测试结果");
+                } else {
+                    self.overlay = Some(Overlay::ModelTestLoading {
+                        provider_id,
+                        model_id,
+                    });
+                }
+            }
+            Overlay::ModelTestResult {
+                provider_id,
+                model_id,
+                success,
+                output,
+                mut scroll,
+            } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('t') => {}
+                KeyCode::Up | KeyCode::Char('k') => {
+                    scroll = scroll.saturating_sub(1);
+                    self.overlay = Some(Overlay::ModelTestResult {
+                        provider_id,
+                        model_id,
+                        success,
+                        output,
+                        scroll,
+                    });
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    scroll = scroll.saturating_add(1);
+                    self.overlay = Some(Overlay::ModelTestResult {
+                        provider_id,
+                        model_id,
+                        success,
+                        output,
+                        scroll,
+                    });
+                }
+                KeyCode::PageUp => {
+                    scroll = scroll.saturating_sub(10);
+                    self.overlay = Some(Overlay::ModelTestResult {
+                        provider_id,
+                        model_id,
+                        success,
+                        output,
+                        scroll,
+                    });
+                }
+                KeyCode::PageDown => {
+                    scroll = scroll.saturating_add(10);
+                    self.overlay = Some(Overlay::ModelTestResult {
+                        provider_id,
+                        model_id,
+                        success,
+                        output,
+                        scroll,
+                    });
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.overlay = Some(Overlay::ModelTestResult {
+                        provider_id,
+                        model_id,
+                        success,
+                        output,
+                        scroll: 0,
+                    });
+                }
+                _ => {
+                    self.overlay = Some(Overlay::ModelTestResult {
+                        provider_id,
+                        model_id,
+                        success,
+                        output,
+                        scroll,
+                    });
+                }
+            },
         }
     }
 
@@ -1085,6 +1188,95 @@ impl App {
             None,
             &json!({"contextWindow": 128000, "maxTokens": 16384}),
         )));
+    }
+
+    fn start_model_test(&mut self) {
+        let (Some(provider), Some(model)) = (self.selected_provider(), self.selected_model())
+        else {
+            self.set_status(StatusKind::Warning, "请先选择要测试的模型");
+            return;
+        };
+        if self.model_test_rx.is_some() {
+            self.set_status(StatusKind::Warning, "已有模型测试正在运行");
+            return;
+        }
+
+        let provider_id = provider.summary.id;
+        let model_id = model.summary.id;
+        let root = self.doc.root().clone();
+        let config_path = self.doc.path().to_path_buf();
+        let thread_provider_id = provider_id.clone();
+        let thread_model_id = model_id.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = test_model(&root, &config_path, &thread_provider_id, &thread_model_id);
+            let _ = sender.send(ModelTestMessage {
+                provider_id: thread_provider_id,
+                model_id: thread_model_id,
+                result,
+            });
+        });
+        self.model_test_rx = Some(receiver);
+        self.overlay = Some(Overlay::ModelTestLoading {
+            provider_id: provider_id.clone(),
+            model_id: model_id.clone(),
+        });
+        self.set_status(
+            StatusKind::Info,
+            format!("正在通过 Pi 测试 {provider_id}/{model_id}"),
+        );
+    }
+
+    fn poll_model_test(&mut self) {
+        let result = match self.model_test_rx.as_ref().map(Receiver::try_recv) {
+            Some(Ok(result)) => Some(result),
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.model_test_rx = None;
+                if matches!(self.overlay, Some(Overlay::ModelTestLoading { .. })) {
+                    self.overlay = None;
+                    self.set_status(StatusKind::Error, "模型测试任务意外结束");
+                }
+                None
+            }
+            Some(Err(TryRecvError::Empty)) | None => None,
+        };
+        let Some(result) = result else { return };
+        self.model_test_rx = None;
+        if !matches!(
+            self.overlay,
+            Some(Overlay::ModelTestLoading {
+                ref provider_id,
+                ref model_id,
+            }) if provider_id == &result.provider_id && model_id == &result.model_id
+        ) {
+            return;
+        }
+
+        let kind = if result.result.success {
+            StatusKind::Success
+        } else {
+            StatusKind::Error
+        };
+        self.set_status(
+            kind,
+            format!(
+                "模型测试{}：{}/{}",
+                if result.result.success {
+                    "成功"
+                } else {
+                    "失败"
+                },
+                result.provider_id,
+                result.model_id
+            ),
+        );
+        self.overlay = Some(Overlay::ModelTestResult {
+            provider_id: result.provider_id,
+            model_id: result.model_id,
+            success: result.result.success,
+            output: result.result.output,
+            scroll: 0,
+        });
     }
 
     fn start_known_models(&mut self) {
@@ -2060,6 +2252,39 @@ mod tests {
                 .iter()
                 .any(|model| model.id == "direct-import")
         );
+    }
+
+    #[test]
+    fn completed_model_test_opens_response_dialog() {
+        let mut app = app();
+        app.focus = Pane::Models;
+        let (sender, receiver) = mpsc::channel();
+        app.model_test_rx = Some(receiver);
+        app.overlay = Some(Overlay::ModelTestLoading {
+            provider_id: "alpha".into(),
+            model_id: "qwen-coder".into(),
+        });
+        sender
+            .send(ModelTestMessage {
+                provider_id: "alpha".into(),
+                model_id: "qwen-coder".into(),
+                result: ModelTestResult {
+                    success: true,
+                    output: "IPMT model test successful.".into(),
+                },
+            })
+            .unwrap();
+
+        app.poll_background();
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::ModelTestResult {
+                success: true,
+                ref output,
+                ..
+            }) if output == "IPMT model test successful."
+        ));
+        assert_eq!(app.status.kind, StatusKind::Success);
     }
 
     #[test]

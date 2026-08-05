@@ -525,6 +525,28 @@ fn overlay_mouse_action(app: &App, event: MouseEvent, terminal: Rect) -> Option<
                 return Some(MouseAction::Key(KeyCode::Esc, KeyModifiers::NONE));
             }
         }
+        Overlay::ModelTestLoading { .. } => {
+            let area = modal_rect(terminal, 62, 10, 88, 58);
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Right))
+                || matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                    && !area.contains(point)
+            {
+                return Some(MouseAction::Key(KeyCode::Esc, KeyModifiers::NONE));
+            }
+        }
+        Overlay::ModelTestResult { .. } => {
+            let area = modal_rect(terminal, 96, 28, 94, 86);
+            if let Some(amount) = scroll
+                && area.contains(point)
+            {
+                return Some(MouseAction::ScrollOverlay(amount));
+            }
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                && !area.contains(point)
+            {
+                return Some(MouseAction::Key(KeyCode::Esc, KeyModifiers::NONE));
+            }
+        }
     }
     None
 }
@@ -627,7 +649,9 @@ fn apply_mouse_action(app: &mut App, action: MouseAction) {
 
 fn scroll_overlay(app: &mut App, amount: isize) {
     match app.overlay.as_mut() {
-        Some(Overlay::Help { scroll }) | Some(Overlay::Diagnostics { scroll }) => {
+        Some(Overlay::Help { scroll })
+        | Some(Overlay::Diagnostics { scroll })
+        | Some(Overlay::ModelTestResult { scroll, .. }) => {
             *scroll = move_index(*scroll, amount, usize::MAX);
         }
         Some(Overlay::Templates {
@@ -1258,6 +1282,12 @@ fn command_specs(width: u16, app: &App) -> Vec<CommandSpec> {
                 color: BLUE,
             },
             CommandSpec {
+                label: " t 测试 ",
+                code: KeyCode::Char('t'),
+                modifiers: normal,
+                color: GREEN,
+            },
+            CommandSpec {
                 label: " s 保存 ",
                 code: KeyCode::Char('s'),
                 modifiers: normal,
@@ -1313,6 +1343,12 @@ fn command_specs(width: u16, app: &App) -> Vec<CommandSpec> {
                 code: KeyCode::Char('f'),
                 modifiers: normal,
                 color: MUTED,
+            },
+            CommandSpec {
+                label: " t 测试 ",
+                code: KeyCode::Char('t'),
+                modifiers: normal,
+                color: GREEN,
             },
             CommandSpec {
                 label: " s 保存 ",
@@ -1451,6 +1487,25 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App, overlay: &Overlay, terminal: R
             *scroll,
             *focus,
         ),
+        Overlay::ModelTestLoading {
+            provider_id,
+            model_id,
+        } => draw_model_test_loading(frame, terminal, provider_id, model_id),
+        Overlay::ModelTestResult {
+            provider_id,
+            model_id,
+            success,
+            output,
+            scroll,
+        } => draw_model_test_result(
+            frame,
+            terminal,
+            provider_id,
+            model_id,
+            *success,
+            output,
+            *scroll,
+        ),
     }
 }
 
@@ -1481,6 +1536,7 @@ fn draw_help(frame: &mut Frame<'_>, terminal: Rect, scroll: usize) {
         help_row("v", "查看全部校验结果"),
         help_row("f", "从当前提供商发现远程模型"),
         help_row("i（模型栏）", "搜索在线已知模型并按能力参数导入"),
+        help_row("t（模型栏）", "通过 Pi 测试当前模型并查看响应或错误"),
         Line::default(),
         help_heading("弹窗焦点"),
         help_row("Tab / Shift+Tab", "直接切换内容区与按钮区"),
@@ -1953,6 +2009,85 @@ fn draw_loading(frame: &mut Frame<'_>, terminal: Rect, provider_id: &str) {
         .block(Block::default().padding(Padding::vertical(1)))
         .style(Style::default().bg(PANEL)),
         inner,
+    );
+}
+
+fn draw_model_test_loading(
+    frame: &mut Frame<'_>,
+    terminal: Rect,
+    provider_id: &str,
+    model_id: &str,
+) {
+    let area = modal_rect(terminal, 62, 10, 88, 58);
+    let block = modal_block(" Pi 模型测试 ");
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let tick = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        / 180;
+    let spinner = ["|", "/", "-", "\\"][tick as usize % 4];
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(format!("{spinner}  "), Style::default().fg(CYAN)),
+                Span::styled(
+                    format!("{provider_id}/{model_id}"),
+                    Style::default().fg(TEXT),
+                ),
+            ]),
+            Line::default(),
+            Line::from(Span::styled(
+                "正在调用 pi 发送最小测试请求...",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(Span::styled(
+                "最多等待 60 秒 · Esc 忽略结果",
+                Style::default().fg(MUTED),
+            )),
+        ])
+        .alignment(Alignment::Center)
+        .block(Block::default().padding(Padding::vertical(1)))
+        .style(Style::default().bg(PANEL)),
+        inner,
+    );
+}
+
+fn draw_model_test_result(
+    frame: &mut Frame<'_>,
+    terminal: Rect,
+    provider_id: &str,
+    model_id: &str,
+    success: bool,
+    output: &str,
+    scroll: usize,
+) {
+    let area = modal_rect(terminal, 96, 28, 94, 86);
+    let state = if success { "成功" } else { "失败" };
+    let title = format!(" 模型测试{state} · {provider_id}/{model_id} ");
+    let block =
+        modal_block(&title).border_style(Style::default().fg(if success { GREEN } else { RED }));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(output.to_owned())
+            .style(Style::default().fg(TEXT).bg(PANEL))
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+            .wrap(Wrap { trim: false }),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new("↑/↓ PgUp/PgDn 滚动 · Esc/q/t 关闭")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(MUTED).bg(PANEL)),
+        rows[1],
     );
 }
 
