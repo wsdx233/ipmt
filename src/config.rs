@@ -8,6 +8,9 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 use url::Url;
 
+const BACKUP_DIRECTORY: &str = ".backup";
+const BACKUP_RETENTION: usize = 20;
+
 pub const SUPPORTED_APIS: &[&str] = &[
     "openai-completions",
     "openai-responses",
@@ -859,6 +862,11 @@ fn temporary_path(path: &Path) -> PathBuf {
 }
 
 fn create_backup_file(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let backup_directory = parent.join(BACKUP_DIRECTORY);
+    fs::create_dir_all(&backup_directory)?;
+    set_directory_permissions(&backup_directory)?;
+
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -867,13 +875,21 @@ fn create_backup_file(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("models.json");
-    for suffix in 0..1000 {
+    let prefix = format!("{name}.bak.");
+    let first_suffix = backup_entries(&backup_directory, &prefix)?
+        .into_iter()
+        .filter(|entry| entry.timestamp == timestamp)
+        .map(|entry| entry.suffix)
+        .max()
+        .map_or(0, |suffix| suffix.saturating_add(1));
+
+    for suffix in first_suffix..first_suffix.saturating_add(1000) {
         let ending = if suffix == 0 {
             String::new()
         } else {
             format!(".{suffix}")
         };
-        let candidate = path.with_file_name(format!("{name}.bak.{timestamp}{ending}"));
+        let candidate = backup_directory.join(format!("{prefix}{timestamp}{ending}"));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -886,6 +902,8 @@ fn create_backup_file(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
                 output.write_all(bytes)?;
                 output.sync_all()?;
                 set_file_permissions(&candidate)?;
+                prune_backups(&backup_directory, &prefix)?;
+                sync_directory(&backup_directory)?;
                 return Ok(candidate);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -896,6 +914,58 @@ fn create_backup_file(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
         io::ErrorKind::AlreadyExists,
         "could not allocate a unique backup name",
     ))
+}
+
+#[derive(Debug)]
+struct BackupEntry {
+    path: PathBuf,
+    timestamp: u64,
+    suffix: u64,
+}
+
+fn backup_entries(directory: &Path, prefix: &str) -> io::Result<Vec<BackupEntry>> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(remainder) = file_name
+            .to_str()
+            .and_then(|name| name.strip_prefix(prefix))
+        else {
+            continue;
+        };
+        let mut parts = remainder.split('.');
+        let Some(timestamp) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
+            continue;
+        };
+        let suffix = match (parts.next(), parts.next()) {
+            (None, None) => 0,
+            (Some(part), None) => match part.parse::<u64>() {
+                Ok(suffix) => suffix,
+                Err(_) => continue,
+            },
+            _ => continue,
+        };
+        entries.push(BackupEntry {
+            path: entry.path(),
+            timestamp,
+            suffix,
+        });
+    }
+    Ok(entries)
+}
+
+fn prune_backups(directory: &Path, prefix: &str) -> io::Result<()> {
+    let mut entries = backup_entries(directory, prefix)?;
+    entries.sort_unstable_by_key(|entry| (entry.timestamp, entry.suffix));
+    let remove_count = entries.len().saturating_sub(BACKUP_RETENTION);
+    for entry in entries.into_iter().take(remove_count) {
+        fs::remove_file(entry.path)?;
+    }
+    Ok(())
 }
 
 fn write_atomic(temp_path: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -1036,6 +1106,7 @@ mod tests {
         let outcome = doc.save(true, false).unwrap();
         let backup = outcome.backup.unwrap();
         assert!(backup.exists());
+        assert_eq!(backup.parent(), Some(dir.path().join(".backup").as_path()));
         assert_eq!(fs::read(&backup).unwrap(), b"{\"providers\":{}}\n");
         let loaded = ConfigDocument::load(&path).unwrap();
         assert!(loaded.provider_value("local").is_some());
@@ -1050,7 +1121,32 @@ mod tests {
                 fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
                 0o600
             );
+            assert_eq!(
+                fs::metadata(dir.path().join(".backup"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
         }
+    }
+
+    #[test]
+    fn backups_keep_only_the_latest_twenty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("custom.json");
+        fs::write(&path, b"{\"providers\":{}}\n").unwrap();
+        let mut doc = ConfigDocument::load(&path).unwrap();
+
+        for index in 0..25 {
+            doc.root["revision"] = json!(index);
+            doc.save(true, false).unwrap();
+        }
+
+        let backups = backup_entries(&dir.path().join(".backup"), "custom.json.bak.").unwrap();
+        assert_eq!(backups.len(), BACKUP_RETENTION);
+        assert!(backups.iter().all(|entry| entry.path.is_file()));
     }
 
     #[test]
