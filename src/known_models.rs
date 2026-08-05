@@ -268,7 +268,17 @@ fn model_cost(source: &Map<String, Value>) -> Option<Map<String, Value>> {
         "cache_creation_input_token_cost",
         "cacheWrite",
     );
-    (!cost.is_empty()).then_some(cost)
+    if cost.is_empty() {
+        return None;
+    }
+
+    // Pi 要求 cost 一旦存在就必须包含全部四个字段。上游价格目录经常只给出
+    // input/output/cacheRead；未知价格使用 0，不能生成缺字段的 cost 对象。
+    for field in ["input", "output", "cacheRead", "cacheWrite"] {
+        cost.entry(field)
+            .or_insert_with(|| Value::Number(Number::from(0)));
+    }
+    Some(cost)
 }
 
 fn copy_price(
@@ -358,6 +368,28 @@ mod tests {
         assert_eq!(xhigh_mapping("claude-opus", source), Some("max"));
         assert_eq!(xhigh_mapping("gpt-5", source), Some("xhigh"));
         assert_eq!(xhigh_mapping("other-model", source), Some("xhigh"));
+    }
+
+    #[test]
+    fn fills_missing_cost_fields_required_by_pi_schema() {
+        let models = parse_known_models(&json!({
+            "partial-price-model": {
+                "mode": "chat",
+                "input_cost_per_token": 0.00000075,
+                "output_cost_per_token": 0.0000045,
+                "cache_read_input_token_cost": 0.000000075
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            models[0].value["cost"],
+            json!({
+                "input": 0.75,
+                "output": 4.5,
+                "cacheRead": 0.075,
+                "cacheWrite": 0
+            })
+        );
     }
 
     #[test]

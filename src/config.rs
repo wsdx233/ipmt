@@ -703,13 +703,18 @@ fn validate_model(
             return;
         };
         for field in ["input", "output", "cacheRead", "cacheWrite"] {
-            if let Some(value) = cost.get(field)
-                && value.as_f64().is_none_or(|number| number < 0.0)
-            {
-                diagnostics.push(Diagnostic::error(
+            match cost.get(field) {
+                None => diagnostics.push(Diagnostic::error(
                     format!("{path}.cost.{field}"),
-                    "cost must be a non-negative number",
-                ));
+                    "cost field is required by pi",
+                )),
+                Some(value) if value.as_f64().is_none_or(|number| number < 0.0) => {
+                    diagnostics.push(Diagnostic::error(
+                        format!("{path}.cost.{field}"),
+                        "cost must be a non-negative number",
+                    ));
+                }
+                Some(_) => {}
             }
         }
     }
@@ -1067,6 +1072,30 @@ mod tests {
         );
         assert!(diagnostics.iter().any(|item| {
             item.path == "$.providers.bad-compat.compat" && item.severity == Severity::Error
+        }));
+    }
+
+    #[test]
+    fn incomplete_cost_is_rejected_before_save() {
+        let doc = ConfigDocument::from_value(
+            "/tmp/models.json",
+            json!({
+                "providers": {
+                    "test": {
+                        "baseUrl": "https://example.com/v1",
+                        "api": "openai-responses",
+                        "models": [{
+                            "id": "model",
+                            "cost": {"input": 1, "output": 2, "cacheRead": 0.1}
+                        }]
+                    }
+                }
+            }),
+        );
+        let diagnostics = doc.validate();
+        assert!(diagnostics.iter().any(|item| {
+            item.path == "$.providers.test.models[0].cost.cacheWrite"
+                && item.severity == Severity::Error
         }));
     }
 
