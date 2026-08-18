@@ -1223,7 +1223,7 @@ impl App {
         });
         self.set_status(
             StatusKind::Info,
-            format!("正在通过 Pi 测试 {provider_id}/{model_id}"),
+            format!("正在测试 {provider_id}/{model_id}"),
         );
     }
 

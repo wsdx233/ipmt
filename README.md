@@ -1,6 +1,6 @@
 # IPMT
 
-IPMT 是一个用 Rust、Ratatui 和 Crossterm 编写的 pi `models.json` 终端编辑器。它直接管理本机的自定义提供商与模型，并尽量保持配置对 pi 新版本的向前兼容。
+IPMT 是一个用 Rust、Ratatui 和 Crossterm 编写的 pi `models.json` 与 omp `models.yml` / `models.yaml` 终端编辑器。它直接管理本机的自定义提供商与模型，并尽量保持配置对 pi 与 omp 新版本的向前兼容。
 
 ## 能力
 
@@ -9,15 +9,15 @@ IPMT 是一个用 Rust、Ratatui 和 Crossterm 编写的 pi `models.json` 终端
 - 编辑推理、图像输入、上下文、输出上限、成本、thinking map、headers 和 compat
 - 从 OpenAI、Anthropic、Google 风格的模型目录发现并批量导入模型
 - 自动合并 `sub2api` 与 `router-for-me/models` 最新模型数据，支持按模型 ID 搜索，并带上下文、推理、视觉、价格和思考级别映射快速导入
-- 选中模型后通过 pi 发起最小连通性测试，在弹窗中查看模型响应或错误信息
+- 选中模型后通过 pi 或 omp 发起最小连通性测试，在弹窗中查看模型响应或错误信息
 - 撤销/重做、删除确认、未保存退出保护和磁盘并发修改检测
-- 保存前执行 schema 与语义校验，未知 JSON 字段和成本阶梯不会因普通表单编辑而丢失
-- 原子保存、时间戳备份，自动保留最近 20 份；Unix 上配置与备份权限为 `0600`，备份目录为 `0700`
+- 保存前执行 schema 与语义校验，未知字段和成本阶梯不会因普通表单编辑而丢失
+- 自动识别 JSON 与 YAML；按输入文件扩展名保存，原子保存、时间戳备份，自动保留最近 20 份；Unix 上配置与备份权限为 `0600`，备份目录为 `0700`
 - API key 默认遮罩；详情、校验和服务端错误中不会显示认证值
 - 响应式布局：宽终端三栏，中等终端双栏，窄终端单栏
 - 完整鼠标操作：点击选择、双击编辑、右键快速编辑、滚轮导航和弹窗按钮
 
-IPMT 编辑的是 pi 的 `models.json`，不修改内置模型缓存 `models-store.json`。pi 每次打开 `/model` 时会重新载入该文件。
+IPMT 编辑的是 pi 的 `models.json` 或 omp 的 `models.yml` / `models.yaml`，不会修改内置模型缓存。指定 YAML 文件时，编辑后的数据仍以 YAML 写回；YAML 注释和原始排版不会保留。
 
 ## 安装
 
@@ -64,16 +64,18 @@ cargo build --release
 
 ## 配置路径
 
-默认路径与 pi 保持一致：
+默认路径与 pi、omp 保持一致：
 
 ```text
 ~/.pi/agent/models.json
+~/.omp/agent/models.yml
 ```
 
-设置 `PI_CODING_AGENT_DIR` 后，IPMT 使用 `$PI_CODING_AGENT_DIR/models.json`。也可显式指定文件，适合先在副本上试用：
+启动时优先使用已有的 pi `models.json`；没有该文件时自动查找 omp `models.yml`、`models.yaml`。设置 `PI_CODING_AGENT_DIR` 后，IPMT 会在该目录中按 `models.yml`、`models.yaml`、`models.json` 顺序使用已有模型列表；设置 `PI_CONFIG_DIR` 后使用其 `agent/` 子目录。也可显式指定文件，适合编辑副本或同时管理两种格式：
 
 ```bash
 ipmt --file ./models.test.json
+ipmt --file ~/.omp/agent/models.yml
 ```
 
 ## 命令行
@@ -81,7 +83,7 @@ ipmt --file ./models.test.json
 ```text
 ipmt [OPTIONS]
 
---file <PATH>  编辑指定 models.json
+--file <PATH>  编辑指定 models.json、models.yml 或 models.yaml
 --check        只校验并输出脱敏摘要，不启动 TUI
 --read-only    可浏览和远程发现，但禁止修改与保存
 --no-backup    普通保存不创建备份
@@ -133,14 +135,14 @@ ipmt [OPTIONS]
 
 ## 模型测试
 
-切换到模型栏并按 `t`，IPMT 会创建当前内存配置的临时快照，并调用 `pi --print --no-session --no-tools` 向选中模型发送最小测试提示。未保存的配置和通过 `--file` 打开的配置也可直接测试；同目录的 `auth.json` 会复制到临时 Pi 配置目录，环境变量与 `models.json` 中的认证方式仍由 pi 解析。
+切换到模型栏并按 `t`，IPMT 会创建当前内存配置的临时快照：JSON 配置调用 `pi`，YAML 配置调用 `omp`，向选中模型发送最小测试提示。未保存的配置和通过 `--file` 打开的配置也可直接测试；同目录的 `auth.json` 会复制到临时配置目录，环境变量与模型列表中的认证方式仍由对应程序解析。
 
-测试在后台运行，不会阻塞 TUI，最长等待 60 秒。完成后弹窗显示模型文本响应，或显示 pi 的 stderr 与退出错误；较长内容可用方向键、PageUp/PageDown 或鼠标滚轮查看。该功能要求 `pi` 命令已安装并位于 `PATH` 中。
+测试在后台运行，不会阻塞 TUI，最长等待 60 秒。完成后弹窗显示模型文本响应，或显示对应程序的 stderr 与退出错误；较长内容可用方向键、PageUp/PageDown 或鼠标滚轮查看。该功能要求目标命令已安装并位于 `PATH` 中。
 
 ## 保存策略
 
 1. 重新比较磁盘内容，发现外部修改时停止保存。
-2. 将当前磁盘版本写入同目录的 `.backup/models.json.bak.<timestamp>`，并只保留该配置最近 20 份备份。
+2. 将当前磁盘版本写入同目录的 `.backup/<配置文件名>.bak.<timestamp>`，并只保留该配置最近 20 份备份。
 3. 在同一目录写入并同步权限为 `0600` 的临时文件。
 4. 原子替换目标文件并同步目录。
 
@@ -157,7 +159,7 @@ cargo test --all-targets
 cargo run -- --check
 ```
 
-项目针对 pi 当前支持的四种 `models.json` API 类型进行校验：`openai-completions`、`openai-responses`、`anthropic-messages` 和 `google-generative-ai`。
+项目校验 pi `models.json` 与 omp `models.yml` / `models.yaml` 通用的模型字段，并接受 pi 与 omp 当前支持的 API 类型：`openai-completions`、`openai-responses`、`openai-codex-responses`、`azure-openai-responses`、`anthropic-messages`、`bedrock-converse-stream`、`google-generative-ai`、`google-gemini-cli` 和 `google-vertex`。OMP 专属的未知字段会在普通表单编辑和保存时保留。
 
 ## 致谢
 

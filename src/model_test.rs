@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tempfile::TempDir;
 
+use crate::config::ConfigFormat;
+
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_OUTPUT_CHARS: usize = 32_000;
 const TEST_PROMPT: &str =
@@ -42,9 +44,14 @@ fn run_model_test(
     provider_id: &str,
     model_id: &str,
 ) -> Result<ModelTestResult, String> {
-    let agent_dir = prepare_agent_dir(root, config_path)
-        .map_err(|error| format!("无法创建临时 Pi 配置：{error}"))?;
-    let mut child = Command::new("pi")
+    let format = ConfigFormat::from_path(config_path);
+    let command = match format {
+        ConfigFormat::Json => "pi",
+        ConfigFormat::Yaml => "omp",
+    };
+    let agent_dir = prepare_agent_dir(root, config_path, format)
+        .map_err(|error| format!("无法创建临时 {command} 配置：{error}"))?;
+    let mut child = Command::new(command)
         .env("PI_CODING_AGENT_DIR", agent_dir.path())
         .args([
             "--provider",
@@ -67,19 +74,19 @@ fn run_model_test(
         .spawn()
         .map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
-                "找不到 pi 命令；请先安装 Pi 并确保它位于 PATH 中".to_owned()
+                format!("找不到 {command} 命令；请先安装并确保它位于 PATH 中")
             } else {
-                format!("无法启动 pi：{error}")
+                format!("无法启动 {command}：{error}")
             }
         })?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "无法读取 pi 标准输出".to_owned())?;
+        .ok_or_else(|| format!("无法读取 {command} 标准输出"))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| "无法读取 pi 错误输出".to_owned())?;
+        .ok_or_else(|| format!("无法读取 {command} 错误输出"))?;
     let stdout_reader = thread::spawn(move || read_all(stdout));
     let stderr_reader = thread::spawn(move || read_all(stderr));
 
@@ -97,11 +104,11 @@ fn run_model_test(
                     .map_err(|error| format!("终止超时测试失败：{error}"))?;
                 break (status, true);
             }
-            Err(error) => return Err(format!("等待 pi 测试进程失败：{error}")),
+            Err(error) => return Err(format!("等待 {command} 测试进程失败：{error}")),
         }
     };
-    let stdout = join_reader(stdout_reader, "标准输出")?;
-    let stderr = join_reader(stderr_reader, "错误输出")?;
+    let stdout = join_reader(stdout_reader, "标准输出", command)?;
+    let stderr = join_reader(stderr_reader, "错误输出", command)?;
     if timed_out {
         let details = combined_output(&stdout, &stderr);
         let message = if details.is_empty() {
@@ -126,20 +133,42 @@ fn read_all(mut reader: impl Read) -> io::Result<Vec<u8>> {
 fn join_reader(
     reader: thread::JoinHandle<io::Result<Vec<u8>>>,
     label: &str,
+    command: &str,
 ) -> Result<Vec<u8>, String> {
     reader
         .join()
-        .map_err(|_| format!("读取 pi {label}的任务意外结束"))?
-        .map_err(|error| format!("读取 pi {label}失败：{error}"))
+        .map_err(|_| format!("读取 {command} {label}的任务意外结束"))?
+        .map_err(|error| format!("读取 {command} {label}失败：{error}"))
 }
 
-fn prepare_agent_dir(root: &Value, config_path: &Path) -> io::Result<TempDir> {
+fn prepare_agent_dir(
+    root: &Value,
+    config_path: &Path,
+    format: ConfigFormat,
+) -> io::Result<TempDir> {
     let directory = tempfile::Builder::new()
         .prefix("ipmt-model-test-")
         .tempdir()?;
-    let mut bytes = serde_json::to_vec_pretty(root).map_err(io::Error::other)?;
+    let (name, mut bytes) = match format {
+        ConfigFormat::Json => (
+            "models.json",
+            serde_json::to_vec_pretty(root).map_err(io::Error::other)?,
+        ),
+        ConfigFormat::Yaml => (
+            "models.yml",
+            serde_yaml::to_string(root)
+                .map(String::into_bytes)
+                .map_err(io::Error::other)?,
+        ),
+    };
+    while bytes
+        .last()
+        .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+    {
+        bytes.pop();
+    }
     bytes.push(b'\n');
-    fs::write(directory.path().join("models.json"), bytes)?;
+    fs::write(directory.path().join(name), bytes)?;
 
     if let Some(parent) = config_path.parent() {
         copy_if_present(parent.join("auth.json"), directory.path().join("auth.json"))?;
@@ -170,15 +199,15 @@ fn result_from_parts(
     let output = if success && !stdout.is_empty() {
         stdout
     } else if !stdout.is_empty() && !stderr.is_empty() {
-        format!("{stdout}\n\n--- pi stderr ---\n{stderr}")
+        format!("{stdout}\n\n--- stderr ---\n{stderr}")
     } else if !stderr.is_empty() {
         stderr
     } else if !stdout.is_empty() {
         stdout
     } else if success {
-        "Pi 测试成功，但模型没有返回文本。".to_owned()
+        "模型测试成功，但模型没有返回文本。".to_owned()
     } else {
-        format!("pi 退出，状态：{status}")
+        format!("模型测试退出，状态：{status}")
     };
     ModelTestResult {
         success,
@@ -190,7 +219,7 @@ fn combined_output(stdout: &[u8], stderr: &[u8]) -> String {
     let stdout = clean_output(stdout);
     let stderr = clean_output(stderr);
     match (stdout.is_empty(), stderr.is_empty()) {
-        (false, false) => format!("{stdout}\n\n--- pi stderr ---\n{stderr}"),
+        (false, false) => format!("{stdout}\n\n--- stderr ---\n{stderr}"),
         (false, true) => stdout,
         (true, false) => stderr,
         (true, true) => String::new(),
@@ -283,5 +312,21 @@ mod tests {
         let mut output = "failed with secret-api-key and Bearer secret-token".to_owned();
         redact_config_secrets(&root, &mut output);
         assert_eq!(output, "failed with [REDACTED] and [REDACTED]");
+    }
+    #[test]
+    fn prepare_agent_dir_writes_yaml_for_omp() {
+        let root = serde_json::json!({
+            "providers": {
+                "gateway": {
+                    "models": [{"id": "model-a"}]
+                }
+            }
+        });
+        let directory =
+            prepare_agent_dir(&root, Path::new("/tmp/models.yml"), ConfigFormat::Yaml).unwrap();
+        let bytes = fs::read(directory.path().join("models.yml")).unwrap();
+        let parsed: Value = serde_yaml::from_slice(&bytes).unwrap();
+        assert_eq!(parsed, root);
+        assert!(!directory.path().join("models.json").exists());
     }
 }

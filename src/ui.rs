@@ -812,7 +812,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .bg(CYAN)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  Pi 模型与提供商", Style::default().fg(TEXT)),
+        Span::styled("  模型与提供商", Style::default().fg(TEXT)),
         Span::raw("  "),
         Span::styled(dirty, Style::default().fg(dirty_color)),
         Span::styled(

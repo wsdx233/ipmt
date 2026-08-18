@@ -29,7 +29,7 @@ use ratatui::backend::CrosstermBackend;
     about = "Edit pi providers and models in a terminal UI"
 )]
 struct Cli {
-    /// Edit a specific models.json instead of pi's active config.
+    /// Edit a specific models.json, models.yml, or models.yaml file.
     #[arg(long, value_name = "PATH")]
     file: Option<PathBuf>,
 
@@ -78,10 +78,30 @@ fn config_path(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(directory) = env::var_os("PI_CODING_AGENT_DIR")
         && !directory.is_empty()
     {
-        return Ok(PathBuf::from(directory).join("models.json"));
+        let directory = PathBuf::from(directory);
+        return Ok(existing_model_path(&directory).unwrap_or_else(|| directory.join("models.json")));
     }
+    if let Some(directory) = env::var_os("PI_CONFIG_DIR")
+        && !directory.is_empty()
+    {
+        let directory = PathBuf::from(directory).join("agent");
+        return Ok(existing_model_path(&directory).unwrap_or_else(|| directory.join("models.yml")));
+    }
+
     let base = BaseDirs::new().context("无法确定用户主目录")?;
-    Ok(base.home_dir().join(".pi/agent/models.json"))
+    let pi_path = base.home_dir().join(".pi/agent/models.json");
+    if pi_path.exists() {
+        return Ok(pi_path);
+    }
+    let omp_directory = base.home_dir().join(".omp/agent");
+    Ok(existing_model_path(&omp_directory).unwrap_or(pi_path))
+}
+
+fn existing_model_path(directory: &Path) -> Option<PathBuf> {
+    ["models.yml", "models.yaml", "models.json"]
+        .into_iter()
+        .map(|name| directory.join(name))
+        .find(|path| path.is_file())
 }
 
 fn expand_tilde(path: &Path) -> PathBuf {

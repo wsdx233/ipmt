@@ -14,9 +14,30 @@ const BACKUP_RETENTION: usize = 20;
 pub const SUPPORTED_APIS: &[&str] = &[
     "openai-completions",
     "openai-responses",
+    "openai-codex-responses",
+    "azure-openai-responses",
     "anthropic-messages",
+    "bedrock-converse-stream",
     "google-generative-ai",
+    "google-gemini-cli",
+    "google-vertex",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFormat {
+    Json,
+    Yaml,
+}
+
+impl ConfigFormat {
+    pub fn from_path(path: &Path) -> Self {
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some(extension) if extension.eq_ignore_ascii_case("yaml") => Self::Yaml,
+            Some(extension) if extension.eq_ignore_ascii_case("yml") => Self::Yaml,
+            _ => Self::Json,
+        }
+    }
+}
 
 const BUILT_IN_PROVIDERS: &[&str] = &[
     "amazon-bedrock",
@@ -128,7 +149,12 @@ pub enum ConfigError {
         path: PathBuf,
         source: serde_json::Error,
     },
-    #[error("the configuration root must be a JSON object")]
+    #[error("invalid YAML in {path}: {source}")]
+    Yaml {
+        path: PathBuf,
+        source: serde_yaml::Error,
+    },
+    #[error("the configuration root must be an object")]
     InvalidRoot,
     #[error("the file changed on disk after it was loaded")]
     ExternalChange,
@@ -138,6 +164,8 @@ pub enum ConfigError {
     Save { path: PathBuf, source: io::Error },
     #[error("cannot serialize configuration: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error("cannot serialize YAML configuration: {0}")]
+    SerializeYaml(serde_yaml::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +177,7 @@ pub struct SaveOutcome {
 #[derive(Debug, Clone)]
 pub struct ConfigDocument {
     path: PathBuf,
+    format: ConfigFormat,
     root: Value,
     loaded_bytes: Option<Vec<u8>>,
 }
@@ -156,25 +185,37 @@ pub struct ConfigDocument {
 impl ConfigDocument {
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, ConfigError> {
         let requested = path.into();
+        let format = ConfigFormat::from_path(&requested);
         let path = resolve_symlink(&requested);
         match fs::read(&path) {
             Ok(bytes) => {
-                let root: Value =
-                    serde_json::from_slice(&bytes).map_err(|source| ConfigError::Json {
-                        path: path.clone(),
-                        source,
-                    })?;
+                let root: Value = match format {
+                    ConfigFormat::Json => {
+                        serde_json::from_slice(&bytes).map_err(|source| ConfigError::Json {
+                            path: path.clone(),
+                            source,
+                        })?
+                    }
+                    ConfigFormat::Yaml => {
+                        serde_yaml::from_slice(&bytes).map_err(|source| ConfigError::Yaml {
+                            path: path.clone(),
+                            source,
+                        })?
+                    }
+                };
                 if !root.is_object() {
                     return Err(ConfigError::InvalidRoot);
                 }
                 Ok(Self {
                     path,
+                    format,
                     root,
                     loaded_bytes: Some(bytes),
                 })
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self {
                 path,
+                format,
                 root: json!({ "providers": {} }),
                 loaded_bytes: None,
             }),
@@ -182,10 +223,16 @@ impl ConfigDocument {
         }
     }
 
+    pub fn format(&self) -> ConfigFormat {
+        self.format
+    }
+
     #[cfg(test)]
     pub fn from_value(path: impl Into<PathBuf>, root: Value) -> Self {
+        let path = path.into();
         Self {
-            path: path.into(),
+            format: ConfigFormat::from_path(&path),
+            path,
             root,
             loaded_bytes: None,
         }
@@ -370,13 +417,27 @@ impl ConfigDocument {
                 diagnostics.push(Diagnostic::error(&path, "provider must be an object"));
                 continue;
             };
-            if !["baseUrl", "headers", "compat", "modelOverrides", "models"]
-                .iter()
-                .any(|field| provider.contains_key(*field))
+            if ![
+                "baseUrl",
+                "headers",
+                "compat",
+                "modelOverrides",
+                "models",
+                "apiKey",
+                "api",
+                "auth",
+                "authHeader",
+                "disableStrictTools",
+                "discovery",
+                "remoteCompaction",
+                "transport",
+            ]
+            .iter()
+            .any(|field| provider.contains_key(*field))
             {
                 diagnostics.push(Diagnostic::error(
                     &path,
-                    "provider must configure baseUrl, headers, compat, modelOverrides, or models",
+                    "provider must configure a supported provider field",
                 ));
             }
 
@@ -534,7 +595,18 @@ impl ConfigDocument {
             }
         }
 
-        let mut bytes = serde_json::to_vec_pretty(&self.root)?;
+        let mut bytes = match self.format {
+            ConfigFormat::Json => serde_json::to_vec_pretty(&self.root)?,
+            ConfigFormat::Yaml => serde_yaml::to_string(&self.root)
+                .map(String::into_bytes)
+                .map_err(ConfigError::SerializeYaml)?,
+        };
+        while bytes
+            .last()
+            .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+        {
+            bytes.pop();
+        }
         bytes.push(b'\n');
         let temp_path = temporary_path(&self.path);
         let result = write_atomic(&temp_path, &self.path, &bytes);
@@ -791,7 +863,7 @@ fn validate_api(value: Option<&Value>, path: &str, diagnostics: &mut Vec<Diagnos
     if !SUPPORTED_APIS.contains(&api) {
         diagnostics.push(Diagnostic::error(
             path,
-            format!("unsupported models.json API type: {api}"),
+            format!("unsupported model API type: {api}"),
         ));
     }
 }
@@ -1213,6 +1285,73 @@ mod tests {
         assert!(matches!(
             doc.save(false, false),
             Err(ConfigError::ExternalChange)
+        ));
+    }
+    #[test]
+    fn yaml_model_list_round_trips_and_preserves_omp_fields() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("models.yml");
+        fs::write(
+            &path,
+            r#"futureRoot: keep
+providers:
+  gateway:
+    baseUrl: https://gateway.example/v1
+    api: openai-codex-responses
+    auth: none
+    disableStrictTools: true
+    models:
+      - id: model-a
+        name: Model A
+        input: [text, image]
+        contextWindow: 1000
+        maxTokens: 500
+        futureModel:
+          route: fast
+"#,
+        )
+        .unwrap();
+
+        let mut doc = ConfigDocument::load(&path).unwrap();
+        assert_eq!(doc.format(), ConfigFormat::Yaml);
+        assert_eq!(doc.providers()[0].model_count, 1);
+        assert!(doc.models("gateway")[0].vision);
+        assert!(
+            doc.validate()
+                .iter()
+                .all(|item| item.severity != Severity::Error)
+        );
+
+        let mut edited = doc.model_value("gateway", 0).unwrap().clone();
+        edited["name"] = json!("Edited Model");
+        assert!(doc.replace_model("gateway", 0, edited));
+        doc.save(false, false).unwrap();
+
+        let bytes = fs::read_to_string(&path).unwrap();
+        assert!(bytes.contains("providers:"));
+        assert!(bytes.contains("openai-codex-responses"));
+        assert!(bytes.contains("futureModel:"));
+        assert!(!bytes.trim_start().starts_with('{'));
+        let loaded = ConfigDocument::load(&path).unwrap();
+        assert_eq!(loaded.root()["futureRoot"], "keep");
+        assert_eq!(
+            loaded.root()["providers"]["gateway"]["models"][0]["name"],
+            "Edited Model"
+        );
+        assert_eq!(
+            loaded.root()["providers"]["gateway"]["models"][0]["futureModel"]["route"],
+            "fast"
+        );
+    }
+
+    #[test]
+    fn yaml_parse_errors_report_yaml_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("models.yaml");
+        fs::write(&path, "providers: [\n").unwrap();
+        assert!(matches!(
+            ConfigDocument::load(&path),
+            Err(ConfigError::Yaml { path: error_path, .. }) if error_path == path
         ));
     }
 }
