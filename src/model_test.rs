@@ -38,6 +38,27 @@ pub fn test_model(
     result
 }
 
+fn model_test_args(format: ConfigFormat, provider_id: &str, model_id: &str) -> Vec<String> {
+    let mut args = vec![
+        "--provider".into(),
+        provider_id.into(),
+        "--model".into(),
+        model_id.into(),
+        "--mode".into(),
+        "text".into(),
+        "--print".into(),
+        "--no-session".into(),
+        "--no-tools".into(),
+        "--no-extensions".into(),
+        "--no-skills".into(),
+    ];
+    if format == ConfigFormat::Json {
+        args.push("--no-context-files".into());
+    }
+    args.push(TEST_PROMPT.into());
+    args
+}
+
 fn run_model_test(
     root: &Value,
     config_path: &Path,
@@ -53,21 +74,7 @@ fn run_model_test(
         .map_err(|error| format!("无法创建临时 {command} 配置：{error}"))?;
     let mut child = Command::new(command)
         .env("PI_CODING_AGENT_DIR", agent_dir.path())
-        .args([
-            "--provider",
-            provider_id,
-            "--model",
-            model_id,
-            "--mode",
-            "text",
-            "--print",
-            "--no-session",
-            "--no-tools",
-            "--no-extensions",
-            "--no-skills",
-            "--no-context-files",
-            TEST_PROMPT,
-        ])
+        .args(model_test_args(format, provider_id, model_id))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -328,5 +335,16 @@ mod tests {
         let parsed: Value = serde_yaml::from_slice(&bytes).unwrap();
         assert_eq!(parsed, root);
         assert!(!directory.path().join("models.json").exists());
+    }
+    #[test]
+    fn omp_model_test_args_omit_pi_only_context_flag() {
+        let args = model_test_args(ConfigFormat::Yaml, "gateway", "model-a");
+        assert!(!args.iter().any(|arg| arg == "--no-context-files"));
+        assert!(args.iter().any(|arg| arg == "--no-tools"));
+        assert!(
+            model_test_args(ConfigFormat::Json, "gateway", "model-a")
+                .iter()
+                .any(|arg| arg == "--no-context-files")
+        );
     }
 }

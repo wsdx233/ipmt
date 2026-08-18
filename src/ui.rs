@@ -15,7 +15,7 @@ use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, DialogFocus, Overlay, Pane, StatusKind};
+use crate::app::{App, ConfigChoice, ConfigPickerFocus, DialogFocus, Overlay, Pane, StatusKind};
 use crate::config::{CredentialHint, Diagnostic, Severity};
 use crate::editor::{FieldKind, FormState, PROVIDER_TEMPLATES};
 
@@ -289,6 +289,14 @@ fn overlay_mouse_action(app: &App, event: MouseEvent, terminal: Rect) -> Option<
             {
                 return Some(MouseAction::ScrollOverlay(amount));
             }
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                && !area.contains(point)
+            {
+                return Some(MouseAction::Key(KeyCode::Esc, KeyModifiers::NONE));
+            }
+        }
+        Overlay::ConfigPicker { .. } => {
+            let area = modal_rect(terminal, 92, 16, 96, 84);
             if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
                 && !area.contains(point)
             {
@@ -1240,6 +1248,12 @@ fn command_specs(width: u16, app: &App) -> Vec<CommandSpec> {
     let mut commands = if width >= 100 {
         vec![
             CommandSpec {
+                label: " z 配置 ",
+                code: KeyCode::Char('z'),
+                modifiers: normal,
+                color: CYAN,
+            },
+            CommandSpec {
                 label: " n 新增 ",
                 code: KeyCode::Char('n'),
                 modifiers: normal,
@@ -1315,6 +1329,12 @@ fn command_specs(width: u16, app: &App) -> Vec<CommandSpec> {
     } else if width >= 66 {
         vec![
             CommandSpec {
+                label: " z 配置 ",
+                code: KeyCode::Char('z'),
+                modifiers: normal,
+                color: CYAN,
+            },
+            CommandSpec {
                 label: " n 新增 ",
                 code: KeyCode::Char('n'),
                 modifiers: normal,
@@ -1365,6 +1385,12 @@ fn command_specs(width: u16, app: &App) -> Vec<CommandSpec> {
         ]
     } else {
         vec![
+            CommandSpec {
+                label: " z 配置 ",
+                code: KeyCode::Char('z'),
+                modifiers: normal,
+                color: CYAN,
+            },
             CommandSpec {
                 label: " n 新增 ",
                 code: KeyCode::Char('n'),
@@ -1433,6 +1459,12 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App, overlay: &Overlay, terminal: R
         Overlay::Diagnostics { scroll } => {
             draw_diagnostics(frame, terminal, &app.diagnostics(), *scroll)
         }
+        Overlay::ConfigPicker {
+            choices,
+            selected,
+            custom_path,
+            focus,
+        } => draw_config_picker(frame, terminal, choices, *selected, custom_path, *focus),
         Overlay::Templates { selected, focus } => {
             draw_templates(frame, terminal, *selected, *focus)
         }
@@ -1531,12 +1563,13 @@ fn draw_help(frame: &mut Frame<'_>, terminal: Rect, scroll: usize) {
         help_row("Ctrl+Z / Ctrl+Y", "撤销 / 重做"),
         Line::default(),
         help_heading("文件与目录"),
+        help_row("z", "快速切换 Pi、OMP 或自定义配置路径"),
         help_row("s / Ctrl+S", "校验并原子保存"),
         help_row("r", "重新载入磁盘文件"),
         help_row("v", "查看全部校验结果"),
         help_row("f", "从当前提供商发现远程模型"),
         help_row("i（模型栏）", "搜索在线已知模型并按能力参数导入"),
-        help_row("t（模型栏）", "通过 Pi 测试当前模型并查看响应或错误"),
+        help_row("t（模型栏）", "测试当前模型并查看响应或错误"),
         Line::default(),
         help_heading("弹窗焦点"),
         help_row("Tab / Shift+Tab", "直接切换内容区与按钮区"),
@@ -1711,6 +1744,115 @@ fn draw_action_bar(
             rect,
         );
     }
+}
+
+fn draw_config_picker(
+    frame: &mut Frame<'_>,
+    terminal: Rect,
+    choices: &[ConfigChoice],
+    selected: usize,
+    custom_path: &str,
+    focus: ConfigPickerFocus,
+) {
+    let area = modal_rect(terminal, 92, 16, 96, 84);
+    let block = modal_block(" 快速切换配置 ");
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new("选择 Pi、OMP 配置，或输入任意自定义模型列表路径。")
+            .style(Style::default().fg(MUTED).bg(PANEL)),
+        rows[0],
+    );
+
+    for (index, choice) in choices.iter().enumerate() {
+        let row = Rect::new(rows[1].x, rows[1].y + index as u16, rows[1].width, 1);
+        if row.bottom() > rows[1].bottom() {
+            break;
+        }
+        let is_selected = focus == ConfigPickerFocus::Choices && index == selected;
+        let background = if is_selected { SURFACE } else { PANEL };
+        let status = if choice.path.is_file() {
+            "已存在"
+        } else {
+            "可创建"
+        };
+        let path = truncate_to_width(
+            &choice.path.display().to_string(),
+            rows[1].width.saturating_sub(18) as usize,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    if is_selected { " › " } else { "   " },
+                    Style::default()
+                        .fg(if is_selected { CYAN } else { MUTED })
+                        .bg(background),
+                ),
+                Span::styled(
+                    format!("{:<8}", choice.label),
+                    Style::default()
+                        .fg(if is_selected { TEXT } else { MUTED })
+                        .bg(background),
+                ),
+                Span::styled(path, Style::default().fg(TEXT).bg(background)),
+                Span::styled(
+                    format!("  {status}"),
+                    Style::default().fg(MUTED).bg(background),
+                ),
+            ]))
+            .style(Style::default().bg(background)),
+            row,
+        );
+    }
+
+    let custom_selected = focus == ConfigPickerFocus::CustomPath;
+    let custom_background = if custom_selected { SURFACE } else { PANEL };
+    let custom_label = " 自定义路径: ";
+    let custom_value = if custom_path.is_empty() {
+        "输入路径，例如 ~/.omp/agent/models.yml"
+    } else {
+        custom_path
+    };
+    let custom_style = if custom_path.is_empty() { MUTED } else { TEXT };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                custom_label,
+                Style::default().fg(CYAN).bg(custom_background),
+            ),
+            Span::styled(
+                custom_value,
+                Style::default().fg(custom_style).bg(custom_background),
+            ),
+        ]))
+        .style(Style::default().bg(custom_background)),
+        rows[2],
+    );
+    if custom_selected {
+        let cursor_x = rows[2]
+            .x
+            .saturating_add(custom_label.width() as u16)
+            .saturating_add(custom_path.width() as u16)
+            .min(rows[2].right().saturating_sub(1));
+        frame.set_cursor_position(Position::new(cursor_x, rows[2].y));
+    }
+
+    frame.render_widget(
+        Paragraph::new("↑↓选择 · Enter切换 · Tab/c自定义 · Ctrl+Delete清空 · Esc关闭")
+            .style(Style::default().fg(BLUE).bg(PANEL)),
+        rows[3],
+    );
 }
 
 fn draw_templates(frame: &mut Frame<'_>, terminal: Rect, selected: usize, focus: DialogFocus) {

@@ -1,9 +1,12 @@
 use std::cmp::Reverse;
+use std::env;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use directories::BaseDirs;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use serde_json::{Value, json};
@@ -73,6 +76,18 @@ pub enum DialogFocus {
 }
 
 #[derive(Debug, Clone)]
+pub struct ConfigChoice {
+    pub label: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigPickerFocus {
+    Choices,
+    CustomPath,
+}
+
+#[derive(Debug, Clone)]
 pub enum ConfirmAction {
     DeleteProvider {
         provider_id: String,
@@ -85,6 +100,9 @@ pub enum ConfirmAction {
     Quit,
     Reload,
     ForceSave,
+    SwitchConfig {
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +112,12 @@ pub enum Overlay {
     },
     Diagnostics {
         scroll: usize,
+    },
+    ConfigPicker {
+        choices: Vec<ConfigChoice>,
+        selected: usize,
+        custom_path: String,
+        focus: ConfigPickerFocus,
     },
     Templates {
         selected: usize,
@@ -560,7 +584,7 @@ impl App {
             KeyCode::Char('f') => self.start_discovery(),
             KeyCode::Char('v') => self.overlay = Some(Overlay::Diagnostics { scroll: 0 }),
             KeyCode::Char('r') => self.request_reload(),
-            KeyCode::Char('s') => self.save(false),
+            KeyCode::Char('z') => self.open_config_picker(),
             _ => {}
         }
     }
@@ -637,6 +661,79 @@ impl App {
                 }
                 _ => self.overlay = Some(Overlay::Diagnostics { scroll }),
             },
+            Overlay::ConfigPicker {
+                choices,
+                mut selected,
+                mut custom_path,
+                mut focus,
+            } => {
+                let mut keep_open = true;
+                match focus {
+                    ConfigPickerFocus::Choices => match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => keep_open = false,
+                        KeyCode::Enter => {
+                            if let Some(choice) = choices.get(selected) {
+                                self.select_config_path(choice.path.clone());
+                                return;
+                            }
+                        }
+                        KeyCode::Tab | KeyCode::Down if selected + 1 >= choices.len() => {
+                            focus = ConfigPickerFocus::CustomPath;
+                        }
+                        KeyCode::Tab => focus = ConfigPickerFocus::CustomPath,
+                        KeyCode::BackTab => focus = ConfigPickerFocus::CustomPath,
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            selected = selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            selected = (selected + 1).min(choices.len().saturating_sub(1));
+                        }
+                        KeyCode::Home | KeyCode::Char('g') => selected = 0,
+                        KeyCode::End | KeyCode::Char('G') => {
+                            selected = choices.len().saturating_sub(1)
+                        }
+                        KeyCode::Char('c') => focus = ConfigPickerFocus::CustomPath,
+                        _ => {}
+                    },
+                    ConfigPickerFocus::CustomPath => match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => keep_open = false,
+                        KeyCode::Enter => {
+                            let path = custom_path.trim();
+                            if path.is_empty() {
+                                self.set_status(StatusKind::Error, "自定义路径不能为空");
+                            } else {
+                                self.select_config_path(expand_config_path(path));
+                                return;
+                            }
+                        }
+                        KeyCode::Tab | KeyCode::BackTab | KeyCode::Up => {
+                            focus = ConfigPickerFocus::Choices;
+                        }
+                        KeyCode::Backspace => {
+                            custom_path.pop();
+                        }
+                        KeyCode::Delete if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            custom_path.clear();
+                        }
+                        KeyCode::Char(character)
+                            if !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                        {
+                            custom_path.push(character);
+                        }
+                        _ => {}
+                    },
+                }
+                if keep_open {
+                    self.overlay = Some(Overlay::ConfigPicker {
+                        choices,
+                        selected,
+                        custom_path,
+                        focus,
+                    });
+                }
+            }
             Overlay::Templates {
                 mut selected,
                 mut focus,
@@ -1166,6 +1263,53 @@ impl App {
                 selected: 0,
                 focus: DialogFocus::Content,
             });
+        }
+    }
+    fn open_config_picker(&mut self) {
+        self.overlay = Some(Overlay::ConfigPicker {
+            choices: quick_config_choices(),
+            selected: 0,
+            custom_path: self.doc.path().display().to_string(),
+            focus: ConfigPickerFocus::Choices,
+        });
+    }
+
+    fn select_config_path(&mut self, path: PathBuf) {
+        if path == self.doc.path() {
+            self.set_status(StatusKind::Info, "当前已经是该配置");
+            return;
+        }
+        if self.is_dirty() {
+            self.overlay = Some(Overlay::Confirm {
+                title: "切换配置文件".into(),
+                message: format!("切换到 {} 会放弃当前未保存的修改。继续？", path.display()),
+                action: ConfirmAction::SwitchConfig { path },
+                selected_button: 0,
+            });
+        } else {
+            self.load_config(path);
+        }
+    }
+
+    fn load_config(&mut self, path: PathBuf) {
+        match ConfigDocument::load(&path) {
+            Ok(doc) => {
+                let display_path = doc.path().display().to_string();
+                self.saved_root = doc.root().clone();
+                self.doc = doc;
+                self.undo.clear();
+                self.redo.clear();
+                self.search.clear();
+                self.discovery_rx = None;
+                self.known_models_rx = None;
+                self.known_models_pending_provider = None;
+                self.model_test_rx = None;
+                self.provider_cursor = 0;
+                self.model_cursor = 0;
+                self.normalize_selection();
+                self.set_status(StatusKind::Success, format!("已切换到 {display_path}"));
+            }
+            Err(error) => self.set_status(StatusKind::Error, error.to_string()),
         }
     }
 
@@ -1698,6 +1842,7 @@ impl App {
             ConfirmAction::Quit => self.should_quit = true,
             ConfirmAction::Reload => self.reload(),
             ConfirmAction::ForceSave => self.save(true),
+            ConfirmAction::SwitchConfig { path } => self.load_config(path),
         }
     }
 
@@ -1919,6 +2064,47 @@ fn model_search_text(model: &ModelSummary) -> Vec<String> {
     }
     values
 }
+fn quick_config_choices() -> Vec<ConfigChoice> {
+    let home = BaseDirs::new()
+        .map(|base| base.home_dir().to_path_buf())
+        .unwrap_or_default();
+    let pi_directory = home.join(".pi/agent");
+    let omp_directory = env::var_os("PI_CONFIG_DIR")
+        .map(PathBuf::from)
+        .map(|directory| directory.join("agent"))
+        .unwrap_or_else(|| home.join(".omp/agent"));
+    vec![
+        ConfigChoice {
+            label: "Pi".into(),
+            path: pi_directory.join("models.json"),
+        },
+        ConfigChoice {
+            label: "OMP".into(),
+            path: existing_yaml_path(&omp_directory),
+        },
+    ]
+}
+
+fn existing_yaml_path(directory: &std::path::Path) -> PathBuf {
+    ["models.yml", "models.yaml"]
+        .into_iter()
+        .map(|name| directory.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| directory.join("models.yml"))
+}
+
+fn expand_config_path(raw: &str) -> PathBuf {
+    if (raw == "~" || raw.starts_with("~/"))
+        && let Some(base) = BaseDirs::new()
+    {
+        return if raw == "~" {
+            base.home_dir().to_path_buf()
+        } else {
+            base.home_dir().join(&raw[2..])
+        };
+    }
+    PathBuf::from(raw)
+}
 
 fn filter_known_models(choices: &[KnownModelChoice], query: &str) -> Vec<usize> {
     if query.trim().is_empty() {
@@ -1984,6 +2170,7 @@ mod tests {
 
     use super::*;
     use crate::config::ConfigDocument;
+    use tempfile::tempdir;
 
     fn press(app: &mut App, code: KeyCode) {
         app.handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
@@ -2011,6 +2198,34 @@ mod tests {
             false,
             true,
         )
+    }
+    #[test]
+    fn z_opens_config_picker() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('z'));
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::ConfigPicker {
+                focus: ConfigPickerFocus::Choices,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn custom_config_path_switches_document() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("custom.yml");
+        let mut app = app();
+        app.overlay = Some(Overlay::ConfigPicker {
+            choices: quick_config_choices(),
+            selected: 0,
+            custom_path: path.display().to_string(),
+            focus: ConfigPickerFocus::CustomPath,
+        });
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.doc.path(), path.as_path());
+        assert!(app.overlay.is_none());
     }
 
     #[test]
