@@ -584,6 +584,7 @@ impl App {
             KeyCode::Char('f') => self.start_discovery(),
             KeyCode::Char('v') => self.overlay = Some(Overlay::Diagnostics { scroll: 0 }),
             KeyCode::Char('r') => self.request_reload(),
+            KeyCode::Char('s') => self.save(false),
             KeyCode::Char('z') => self.open_config_picker(),
             _ => {}
         }
@@ -2210,6 +2211,25 @@ mod tests {
                 ..
             })
         ));
+    }
+    #[test]
+    fn s_saves_omp_configuration() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("models.yml");
+        std::fs::write(&path, "providers: {}\n").unwrap();
+        let mut app = App::new(ConfigDocument::load(&path).unwrap(), false, false);
+        app.doc.replace_root(json!({
+            "providers": {
+                "saved": {"models": []}
+            }
+        }));
+
+        press(&mut app, KeyCode::Char('s'));
+
+        let saved = ConfigDocument::load(&path).unwrap();
+        assert_eq!(saved.root()["providers"]["saved"]["models"], json!([]));
+        assert!(!app.is_dirty());
+        assert_eq!(app.status.kind, StatusKind::Success);
     }
 
     #[test]
