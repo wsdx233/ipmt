@@ -52,6 +52,7 @@ fn model_test_args(format: ConfigFormat, provider_id: &str, model_id: &str) -> V
         "--no-extensions".into(),
         "--no-skills".into(),
     ];
+    // pi supports --no-context-files; omp does not recognize this pi-only flag.
     if format == ConfigFormat::Json {
         args.push("--no-context-files".into());
     }
@@ -73,6 +74,7 @@ fn run_model_test(
     let agent_dir = prepare_agent_dir(root, config_path, format)
         .map_err(|error| format!("无法创建临时 {command} 配置：{error}"))?;
     let mut child = Command::new(command)
+        .env_remove("PI_CONFIG_DIR")
         .env("PI_CODING_AGENT_DIR", agent_dir.path())
         .args(model_test_args(format, provider_id, model_id))
         .stdin(Stdio::null())
@@ -148,6 +150,18 @@ fn join_reader(
         .map_err(|error| format!("读取 {command} {label}失败：{error}"))
 }
 
+fn model_file_name(config_path: &Path, format: ConfigFormat) -> &'static str {
+    match format {
+        ConfigFormat::Json => "models.json",
+        ConfigFormat::Yaml => match config_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+        {
+            Some(extension) if extension.eq_ignore_ascii_case("yaml") => "models.yaml",
+            _ => "models.yml",
+        },
+    }
+}
 fn prepare_agent_dir(
     root: &Value,
     config_path: &Path,
@@ -156,17 +170,12 @@ fn prepare_agent_dir(
     let directory = tempfile::Builder::new()
         .prefix("ipmt-model-test-")
         .tempdir()?;
-    let (name, mut bytes) = match format {
-        ConfigFormat::Json => (
-            "models.json",
-            serde_json::to_vec_pretty(root).map_err(io::Error::other)?,
-        ),
-        ConfigFormat::Yaml => (
-            "models.yml",
-            serde_yaml::to_string(root)
-                .map(String::into_bytes)
-                .map_err(io::Error::other)?,
-        ),
+    let name = model_file_name(config_path, format);
+    let mut bytes = match format {
+        ConfigFormat::Json => serde_json::to_vec_pretty(root).map_err(io::Error::other)?,
+        ConfigFormat::Yaml => serde_yaml::to_string(root)
+            .map(String::into_bytes)
+            .map_err(io::Error::other)?,
     };
     while bytes
         .last()
@@ -335,6 +344,15 @@ mod tests {
         let parsed: Value = serde_yaml::from_slice(&bytes).unwrap();
         assert_eq!(parsed, root);
         assert!(!directory.path().join("models.json").exists());
+    }
+
+    #[test]
+    fn prepare_agent_dir_uses_models_yaml_for_yaml_sources() {
+        let root = serde_json::json!({"providers": {"gateway": {"models": []}}});
+        let directory =
+            prepare_agent_dir(&root, Path::new("/tmp/custom.yaml"), ConfigFormat::Yaml).unwrap();
+        assert!(directory.path().join("models.yaml").is_file());
+        assert!(!directory.path().join("models.yml").exists());
     }
     #[test]
     fn omp_model_test_args_omit_pi_only_context_flag() {

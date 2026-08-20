@@ -71,7 +71,7 @@ cargo build --release
 ~/.omp/agent/models.yml
 ```
 
-启动时优先使用已有的 pi `models.json`；没有该文件时自动查找 omp `models.yml`、`models.yaml`。设置 `PI_CODING_AGENT_DIR` 后，IPMT 会在该目录中按 `models.yml`、`models.yaml`、`models.json` 顺序使用已有模型列表；设置 `PI_CONFIG_DIR` 后使用其 `agent/` 子目录。也可显式指定文件，适合编辑副本或同时管理两种格式：
+启动时优先使用已有的 pi `models.json`；没有该文件时自动查找 omp `models.yml`、`models.yaml`。设置 `PI_CODING_AGENT_DIR` 后将其视为 agent 目录，并按 `models.yml`、`models.yaml`、`models.json` 顺序使用已有模型列表；设置 `PI_CONFIG_DIR` 后将其视为配置根目录，使用其 `agent/` 子目录，并优先查找 YAML。两个变量为空字符串时按未设置处理。TUI 中的快捷配置切换遵循同样的目录设置。也可显式指定文件，适合编辑副本或同时管理两种格式：
 
 ```bash
 ipmt --file ./models.test.json

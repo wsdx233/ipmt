@@ -1,4 +1,3 @@
-use std::env;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -17,7 +16,10 @@ use crossterm::terminal::{
 };
 use directories::BaseDirs;
 use ipmt::app::App;
-use ipmt::config::{ConfigDocument, Severity};
+use ipmt::config::{
+    ConfigDocument, Severity, configured_agent_directory, configured_omp_agent_directory,
+    existing_model_path, existing_yaml_path,
+};
 use ipmt::ui;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -75,17 +77,11 @@ fn config_path(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(expand_tilde(path));
     }
-    if let Some(directory) = env::var_os("PI_CODING_AGENT_DIR")
-        && !directory.is_empty()
-    {
-        let directory = PathBuf::from(directory);
+    if let Some(directory) = configured_agent_directory() {
         return Ok(existing_model_path(&directory).unwrap_or_else(|| directory.join("models.json")));
     }
-    if let Some(directory) = env::var_os("PI_CONFIG_DIR")
-        && !directory.is_empty()
-    {
-        let directory = PathBuf::from(directory).join("agent");
-        return Ok(existing_model_path(&directory).unwrap_or_else(|| directory.join("models.yml")));
+    if let Some(directory) = configured_omp_agent_directory() {
+        return Ok(existing_yaml_path(&directory).unwrap_or_else(|| directory.join("models.yml")));
     }
 
     let base = BaseDirs::new().context("无法确定用户主目录")?;
@@ -94,14 +90,7 @@ fn config_path(explicit: Option<&Path>) -> Result<PathBuf> {
         return Ok(pi_path);
     }
     let omp_directory = base.home_dir().join(".omp/agent");
-    Ok(existing_model_path(&omp_directory).unwrap_or(pi_path))
-}
-
-fn existing_model_path(directory: &Path) -> Option<PathBuf> {
-    ["models.yml", "models.yaml", "models.json"]
-        .into_iter()
-        .map(|name| directory.join(name))
-        .find(|path| path.is_file())
+    Ok(existing_yaml_path(&omp_directory).unwrap_or(pi_path))
 }
 
 fn expand_tilde(path: &Path) -> PathBuf {

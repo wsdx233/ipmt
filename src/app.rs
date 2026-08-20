@@ -1,5 +1,4 @@
 use std::cmp::Reverse;
-use std::env;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -13,6 +12,8 @@ use serde_json::{Value, json};
 
 use crate::config::{
     ConfigDocument, ConfigError, Diagnostic, ModelSummary, ProviderSummary, Severity,
+    configured_agent_directory, configured_omp_agent_directory, existing_model_path,
+    existing_yaml_path,
 };
 use crate::discovery::{DiscoveredModel, DiscoveryRequest, discover_models};
 use crate::editor::{
@@ -2069,29 +2070,20 @@ fn quick_config_choices() -> Vec<ConfigChoice> {
     let home = BaseDirs::new()
         .map(|base| base.home_dir().to_path_buf())
         .unwrap_or_default();
-    let pi_directory = home.join(".pi/agent");
-    let omp_directory = env::var_os("PI_CONFIG_DIR")
-        .map(PathBuf::from)
-        .map(|directory| directory.join("agent"))
-        .unwrap_or_else(|| home.join(".omp/agent"));
+    let pi_directory = configured_agent_directory().unwrap_or_else(|| home.join(".pi/agent"));
+    let omp_directory = configured_omp_agent_directory().unwrap_or_else(|| home.join(".omp/agent"));
     vec![
         ConfigChoice {
             label: "Pi".into(),
-            path: pi_directory.join("models.json"),
+            path: existing_model_path(&pi_directory)
+                .unwrap_or_else(|| pi_directory.join("models.json")),
         },
         ConfigChoice {
             label: "OMP".into(),
-            path: existing_yaml_path(&omp_directory),
+            path: existing_yaml_path(&omp_directory)
+                .unwrap_or_else(|| omp_directory.join("models.yml")),
         },
     ]
-}
-
-fn existing_yaml_path(directory: &std::path::Path) -> PathBuf {
-    ["models.yml", "models.yaml"]
-        .into_iter()
-        .map(|name| directory.join(name))
-        .find(|path| path.is_file())
-        .unwrap_or_else(|| directory.join("models.yml"))
 }
 
 fn expand_config_path(raw: &str) -> PathBuf {

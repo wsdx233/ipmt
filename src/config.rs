@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::env;
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -37,6 +39,36 @@ impl ConfigFormat {
             _ => Self::Json,
         }
     }
+}
+
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    non_empty_path(env::var_os(name))
+}
+
+fn non_empty_path(value: Option<OsString>) -> Option<PathBuf> {
+    value.filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
+pub fn configured_agent_directory() -> Option<PathBuf> {
+    non_empty_env_path("PI_CODING_AGENT_DIR")
+}
+
+pub fn configured_omp_agent_directory() -> Option<PathBuf> {
+    non_empty_env_path("PI_CONFIG_DIR").map(|directory| directory.join("agent"))
+}
+
+pub fn existing_model_path(directory: &Path) -> Option<PathBuf> {
+    ["models.yml", "models.yaml", "models.json"]
+        .into_iter()
+        .map(|name| directory.join(name))
+        .find(|path| path.is_file())
+}
+
+pub fn existing_yaml_path(directory: &Path) -> Option<PathBuf> {
+    ["models.yml", "models.yaml"]
+        .into_iter()
+        .map(|name| directory.join(name))
+        .find(|path| path.is_file())
 }
 
 const BUILT_IN_PROVIDERS: &[&str] = &[
@@ -1096,6 +1128,40 @@ fn sync_directory(_path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn empty_environment_paths_are_ignored() {
+        assert_eq!(non_empty_path(Some(OsString::new())), None);
+        assert_eq!(non_empty_path(None), None);
+        assert_eq!(
+            non_empty_path(Some(OsString::from("/tmp/agent"))),
+            Some(PathBuf::from("/tmp/agent"))
+        );
+    }
+
+    #[test]
+    fn model_path_helpers_keep_yaml_precedence() {
+        let directory = tempdir().unwrap();
+        assert_eq!(existing_model_path(directory.path()), None);
+        assert_eq!(existing_yaml_path(directory.path()), None);
+
+        fs::write(directory.path().join("models.json"), b"{}").unwrap();
+        assert_eq!(
+            existing_model_path(directory.path()),
+            Some(directory.path().join("models.json"))
+        );
+        assert_eq!(existing_yaml_path(directory.path()), None);
+
+        fs::write(directory.path().join("models.yaml"), b"{}").unwrap();
+        assert_eq!(
+            existing_model_path(directory.path()),
+            Some(directory.path().join("models.yaml"))
+        );
+        assert_eq!(
+            existing_yaml_path(directory.path()),
+            Some(directory.path().join("models.yaml"))
+        );
+    }
 
     #[test]
     fn summaries_and_validation_cover_common_errors() {
