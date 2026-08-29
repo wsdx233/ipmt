@@ -20,6 +20,12 @@ use crate::editor::{
     FormAction, FormState, FormSubmission, PROVIDER_TEMPLATES, ProviderTemplateInfo,
     provider_template,
 };
+
+fn get_clipboard_text() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    clipboard.get_text().ok()
+}
+
 use crate::known_models::{KnownModel, fetch_known_models};
 use crate::model_test::{ModelTestResult, test_model};
 
@@ -508,30 +514,41 @@ impl App {
                 }
             }
             Event::Paste(text) => {
-                if let Some(Overlay::Form(form)) = self.overlay.as_mut() {
-                    form.insert_paste(&text);
-                } else if let Some(Overlay::DiscoveryPicker {
-                    choices,
-                    filtered,
-                    query,
-                    filter_active: true,
-                    cursor,
-                    scroll,
-                    ..
-                }) = self.overlay.as_mut()
-                {
-                    query.push_str(&text.replace(['\r', '\n'], " "));
-                    *filtered = filter_discovered_models(choices, query);
-                    *cursor = 0;
-                    *scroll = 0;
-                } else if self.search_active {
-                    self.search.push_str(&text.replace(['\r', '\n'], " "));
-                    self.normalize_selection();
-                }
+                self.paste_text(&text);
             }
             _ => {}
         }
     }
+    pub fn paste_text(&mut self, text: &str) {
+        if let Some(Overlay::Form(form)) = self.overlay.as_mut() {
+            form.insert_paste(text);
+        } else if let Some(Overlay::DiscoveryPicker {
+            choices,
+            filtered,
+            query,
+            filter_active: true,
+            cursor,
+            scroll,
+            ..
+        }) = self.overlay.as_mut()
+        {
+            query.push_str(&text.replace(['\r', '\n'], " "));
+            *filtered = filter_discovered_models(choices, query);
+            *cursor = 0;
+            *scroll = 0;
+        } else if let Some(Overlay::ConfigPicker {
+            custom_path,
+            focus: ConfigPickerFocus::CustomPath,
+            ..
+        }) = self.overlay.as_mut()
+        {
+            custom_path.push_str(&text.replace(['\r', '\n'], " "));
+        } else if self.search_active {
+            self.search.push_str(&text.replace(['\r', '\n'], " "));
+            self.normalize_selection();
+        }
+    }
+
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -592,18 +609,27 @@ impl App {
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('v') => {
+                    if let Some(text) = get_clipboard_text() {
+                        self.paste_text(&text);
+                    }
+                    return;
+                }
+                KeyCode::Delete | KeyCode::Char('u') => {
+                    self.search.clear();
+                    self.normalize_selection();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Esc | KeyCode::Enter => self.search_active = false,
             KeyCode::Backspace => {
                 self.search.pop();
-                self.normalize_selection();
-            }
-            KeyCode::Delete if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.search.clear();
-                self.normalize_selection();
-            }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.search.clear();
                 self.normalize_selection();
             }
             KeyCode::Char(character)
@@ -713,6 +739,11 @@ impl App {
                         }
                         KeyCode::Backspace => {
                             custom_path.pop();
+                        }
+                        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(text) = get_clipboard_text() {
+                                custom_path.push_str(&text.replace(['\r', '\n'], " "));
+                            }
                         }
                         KeyCode::Delete if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             custom_path.clear();
@@ -875,6 +906,14 @@ impl App {
                             filtered = filter_discovered_models(&choices, &query);
                             cursor = 0;
                             scroll = 0;
+                        }
+                        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(text) = get_clipboard_text() {
+                                query.push_str(&text.replace(['\r', '\n'], " "));
+                                filtered = filter_discovered_models(&choices, &query);
+                                cursor = 0;
+                                scroll = 0;
+                            }
                         }
                         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             query.clear();

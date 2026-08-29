@@ -269,7 +269,7 @@ impl FormState {
             focus: FormFocus::Fields,
             cursor: grapheme_count(&id),
             scroll: 0,
-            reveal_secrets: false,
+            reveal_secrets: true,
             error: None,
         }
     }
@@ -403,7 +403,7 @@ impl FormState {
             focus: FormFocus::Fields,
             cursor: grapheme_count(&id),
             scroll: 0,
-            reveal_secrets: false,
+            reveal_secrets: true,
             error: None,
         }
     }
@@ -501,6 +501,14 @@ impl FormState {
                 }
                 KeyCode::Char('w') => {
                     self.delete_previous_word();
+                    return FormAction::None;
+                }
+                KeyCode::Char('v') => {
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        if let Ok(text) = clipboard.get_text() {
+                            self.insert_paste(&text);
+                        }
+                    }
                     return FormAction::None;
                 }
                 _ => {}

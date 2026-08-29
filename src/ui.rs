@@ -2025,7 +2025,7 @@ fn draw_form(frame: &mut Frame<'_>, terminal: Rect, form: &FormState) {
         let decoration = match &field.kind {
             FieldKind::Select(_) => "  < >",
             FieldKind::Bool => "  Space",
-            FieldKind::Secret if !form.reveal_secrets => "  F3",
+            FieldKind::Secret => "  F3",
             _ => "",
         };
         frame.render_widget(
@@ -2092,7 +2092,11 @@ fn draw_form(frame: &mut Frame<'_>, terminal: Rect, form: &FormState) {
                     FieldKind::Select(_) => "左右键切换选项",
                     FieldKind::Bool => "Space 或 Enter 切换",
                     FieldKind::JsonObject => "必须输入一个 JSON 对象",
-                    FieldKind::Secret => "内容默认遮罩；F3 临时显示",
+                    FieldKind::Secret => if form.reveal_secrets {
+                        "F3 隐藏密钥内容"
+                    } else {
+                        "F3 显示密钥内容"
+                    },
                     _ => "",
                 },
                 Style::default().fg(BLUE),
