@@ -11,8 +11,8 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use serde_json::{Value, json};
 
 use crate::config::{
-    ConfigDocument, ConfigError, Diagnostic, ModelSummary, ProviderSummary, Severity,
-    configured_agent_directory, configured_omp_agent_directory, existing_model_path,
+    ConfigDocument, ConfigError, ConfigFormat, Diagnostic, ModelSummary, ProviderSummary,
+    Severity, configured_agent_directory, configured_omp_agent_directory, existing_model_path,
     existing_yaml_path,
 };
 use crate::discovery::{DiscoveredModel, DiscoveryRequest, discover_models};
@@ -24,6 +24,13 @@ use crate::editor::{
 fn get_clipboard_text() -> Option<String> {
     let mut clipboard = arboard::Clipboard::new().ok()?;
     clipboard.get_text().ok()
+}
+
+fn set_clipboard_text(text: &str) -> bool {
+    let Ok(mut clipboard) = arboard::Clipboard::new() else {
+        return false;
+    };
+    clipboard.set_text(text.to_owned()).is_ok()
 }
 
 use crate::known_models::{KnownModel, fetch_known_models};
@@ -551,12 +558,19 @@ impl App {
 
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char('c') => self.copy_selected_code(),
+                _ => {}
+            }
+            return;
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('s') => self.save(false),
                 KeyCode::Char('z') => self.undo(),
                 KeyCode::Char('y') => self.redo(),
-                KeyCode::Char('c') => self.request_quit(),
                 _ => {}
             }
             return;
@@ -607,19 +621,21 @@ impl App {
             _ => {}
         }
     }
-
     fn handle_search_key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
+                KeyCode::Char('c') => {
+                    if set_clipboard_text(&self.search) {
+                        self.set_status(StatusKind::Success, "已复制搜索内容到剪贴板");
+                    } else {
+                        self.set_status(StatusKind::Error, "写入剪贴板失败");
+                    }
+                    return;
+                }
                 KeyCode::Char('v') => {
                     if let Some(text) = get_clipboard_text() {
                         self.paste_text(&text);
                     }
-                    return;
-                }
-                KeyCode::Delete | KeyCode::Char('u') => {
-                    self.search.clear();
-                    self.normalize_selection();
                     return;
                 }
                 _ => {}
@@ -740,7 +756,14 @@ impl App {
                         KeyCode::Backspace => {
                             custom_path.pop();
                         }
-                        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => {
+                            if set_clipboard_text(&custom_path) {
+                                self.set_status(StatusKind::Success, "已复制路径到剪贴板");
+                            } else {
+                                self.set_status(StatusKind::Error, "写入剪贴板失败");
+                            }
+                        }
+                        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::ALT) => {
                             if let Some(text) = get_clipboard_text() {
                                 custom_path.push_str(&text.replace(['\r', '\n'], " "));
                             }
@@ -907,7 +930,14 @@ impl App {
                             cursor = 0;
                             scroll = 0;
                         }
-                        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => {
+                            if set_clipboard_text(&query) {
+                                self.set_status(StatusKind::Success, "已复制搜索词到剪贴板");
+                            } else {
+                                self.set_status(StatusKind::Error, "写入剪贴板失败");
+                            }
+                        }
+                        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::ALT) => {
                             if let Some(text) = get_clipboard_text() {
                                 query.push_str(&text.replace(['\r', '\n'], " "));
                                 filtered = filter_discovered_models(&choices, &query);
@@ -1759,6 +1789,67 @@ impl App {
         }
     }
 
+    fn copy_selected_code(&mut self) {
+        match self.focus {
+            Pane::Providers => {
+                let Some(provider) = self.selected_provider() else {
+                    return;
+                };
+                let Some(value) = self.doc.provider_value(&provider.summary.id) else {
+                    return;
+                };
+                let text = match self.doc.format() {
+                    ConfigFormat::Json => serde_json::to_string_pretty(value).ok(),
+                    ConfigFormat::Yaml => serde_yaml::to_string(value).ok(),
+                };
+                if let Some(code) = text {
+                    if set_clipboard_text(&code) {
+                        let format_name = match self.doc.format() {
+                            ConfigFormat::Json => "JSON",
+                            ConfigFormat::Yaml => "YAML",
+                        };
+                        self.set_status(
+                            StatusKind::Success,
+                            format!("已复制提供商 {} 的 {format_name} 代码", provider.summary.id),
+                        );
+                    } else {
+                        self.set_status(StatusKind::Error, "写入剪贴板失败");
+                    }
+                }
+            }
+            Pane::Models => {
+                let (Some(provider), Some(model)) =
+                    (self.selected_provider(), self.selected_model())
+                else {
+                    return;
+                };
+                let Some(value) =
+                    self.doc.model_value(&provider.summary.id, model.source_index)
+                else {
+                    return;
+                };
+                let text = match self.doc.format() {
+                    ConfigFormat::Json => serde_json::to_string_pretty(value).ok(),
+                    ConfigFormat::Yaml => serde_yaml::to_string(value).ok(),
+                };
+                if let Some(code) = text {
+                    if set_clipboard_text(&code) {
+                        let format_name = match self.doc.format() {
+                            ConfigFormat::Json => "JSON",
+                            ConfigFormat::Yaml => "YAML",
+                        };
+                        self.set_status(
+                            StatusKind::Success,
+                            format!("已复制模型 {} 的 {format_name} 代码", model.summary.id),
+                        );
+                    } else {
+                        self.set_status(StatusKind::Error, "写入剪贴板失败");
+                    }
+                }
+            }
+        }
+    }
+
     fn start_discovery(&mut self) {
         let Some(provider) = self.selected_provider() else {
             self.set_status(StatusKind::Warning, "请先选择提供商");
@@ -2558,5 +2649,35 @@ mod tests {
         let app = app();
         assert_eq!(app.unique_provider_id("alpha"), "alpha-2");
         assert_eq!(app.unique_model_id("alpha", "llama"), "llama-2");
+    }
+
+    #[test]
+    fn alt_c_copies_selected_provider_and_model_code() {
+        let mut app = app();
+        app.focus = Pane::Providers;
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT)));
+        assert!(
+            app.status.text.contains("已复制提供商")
+                || app.status.text.contains("写入剪贴板失败")
+        );
+
+        app.focus = Pane::Models;
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT)));
+        assert!(
+            app.status.text.contains("已复制模型")
+                || app.status.text.contains("写入剪贴板失败")
+        );
+    }
+
+    #[test]
+    fn alt_c_in_search_copies_search_text() {
+        let mut app = app();
+        app.search_active = true;
+        app.search = "test-query".into();
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT)));
+        assert!(
+            app.status.text.contains("已复制搜索内容")
+                || app.status.text.contains("写入剪贴板失败")
+        );
     }
 }

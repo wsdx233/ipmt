@@ -1560,6 +1560,8 @@ fn draw_help(frame: &mut Frame<'_>, terminal: Rect, scroll: usize) {
         help_row("Enter / e", "编辑当前项"),
         help_row("d / Delete", "删除当前项"),
         help_row("c", "复制当前项并生成唯一 ID"),
+        help_row("Alt+C", "复制当前项 JSON/YAML 代码（编辑时复制输入框）"),
+        help_row("Alt+V", "粘贴剪贴板内容到当前输入框"),
         help_row("Ctrl+Z / Ctrl+Y", "撤销 / 重做"),
         Line::default(),
         help_heading("文件与目录"),

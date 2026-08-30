@@ -476,6 +476,31 @@ impl FormState {
 
     pub fn handle_key(&mut self, event: KeyEvent) -> FormAction {
         self.error = None;
+        if event.modifiers.contains(KeyModifiers::ALT) {
+            if !self.fields_focused() {
+                return FormAction::None;
+            }
+            match event.code {
+                KeyCode::Char('c') => {
+                    if self.current().is_editable_text() {
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            let _ = clipboard.set_text(self.current().value.clone());
+                        }
+                    }
+                    return FormAction::None;
+                }
+                KeyCode::Char('v') => {
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        if let Ok(text) = clipboard.get_text() {
+                            self.insert_paste(&text);
+                        }
+                    }
+                    return FormAction::None;
+                }
+                _ => {}
+            }
+        }
+
         if event.modifiers.contains(KeyModifiers::CONTROL) {
             if event.code == KeyCode::Char('s') {
                 return FormAction::Submit;
@@ -501,14 +526,6 @@ impl FormState {
                 }
                 KeyCode::Char('w') => {
                     self.delete_previous_word();
-                    return FormAction::None;
-                }
-                KeyCode::Char('v') => {
-                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                        if let Ok(text) = clipboard.get_text() {
-                            self.insert_paste(&text);
-                        }
-                    }
                     return FormAction::None;
                 }
                 _ => {}
