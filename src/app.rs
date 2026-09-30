@@ -561,6 +561,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
                 KeyCode::Char('c') => self.copy_selected_code(),
+                KeyCode::Char('v') => self.paste_code_to_list(),
                 _ => {}
             }
             return;
@@ -1850,6 +1851,189 @@ impl App {
         }
     }
 
+    fn paste_code_to_list(&mut self) {
+        if !self.ensure_writable() {
+            return;
+        }
+        let Some(text) = get_clipboard_text() else {
+            self.set_status(StatusKind::Error, "剪贴板为空或无法读取");
+            return;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            self.set_status(StatusKind::Warning, "剪贴板内容为空");
+            return;
+        }
+        let value: Value = if let Ok(val) = serde_json::from_str::<Value>(text) {
+            val
+        } else if let Ok(val) = serde_yaml::from_str::<Value>(text) {
+            val
+        } else {
+            self.set_status(StatusKind::Error, "剪贴板内容不是有效的 JSON 或 YAML 对象");
+            return;
+        };
+
+        let Some(obj) = value.as_object() else {
+            self.set_status(StatusKind::Error, "剪贴板内容不是对象结构 (Object)");
+            return;
+        };
+
+        // 智能推断对象类型：
+        // 1. 检查是否为单 key 包装的 Provider 对象，例如 { "my-provider": { "baseUrl": ... } }
+        if obj.len() == 1 {
+            let (single_key, single_val) = obj.iter().next().unwrap();
+            if let Some(inner_obj) = single_val.as_object() {
+                let has_provider_fields = inner_obj.contains_key("baseUrl")
+                    || inner_obj.contains_key("base_url")
+                    || inner_obj.contains_key("apiKey")
+                    || inner_obj.contains_key("api_key")
+                    || inner_obj.contains_key("models")
+                    || inner_obj.contains_key("modelOverrides")
+                    || inner_obj.contains_key("headers");
+                if has_provider_fields {
+                    self.paste_provider(Some(single_key.clone()), single_val.clone());
+                    return;
+                }
+            }
+        }
+
+        let has_provider_clues = obj.contains_key("baseUrl")
+            || obj.contains_key("base_url")
+            || obj.contains_key("apiKey")
+            || obj.contains_key("api_key")
+            || obj.contains_key("models")
+            || obj.contains_key("modelOverrides");
+        let has_model_clues = obj.contains_key("contextWindow")
+            || obj.contains_key("context_window")
+            || obj.contains_key("maxTokens")
+            || obj.contains_key("max_tokens")
+            || obj.contains_key("reasoning")
+            || obj.contains_key("input");
+
+        if has_provider_clues && !has_model_clues {
+            self.paste_provider(None, value);
+        } else if has_model_clues && !has_provider_clues {
+            self.paste_model(value);
+        } else {
+            // 无法仅凭结构唯一推断时，按当前聚焦面板处理
+            match self.focus {
+                Pane::Models => self.paste_model(value),
+                Pane::Providers => self.paste_provider(None, value),
+            }
+        }
+    }
+
+    fn paste_provider(&mut self, explicit_id: Option<String>, mut value: Value) {
+        let id = explicit_id
+            .or_else(|| {
+                value
+                    .as_object()
+                    .and_then(|obj| obj.get("id"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .or_else(|| {
+                value
+                    .as_object()
+                    .and_then(|obj| obj.get("name"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .or_else(|| {
+                value
+                    .as_object()
+                    .and_then(|obj| obj.get("api"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| "provider".to_owned());
+
+        let id = id.trim().to_owned();
+        let base_id = if id.is_empty() { "provider".to_owned() } else { id };
+        let new_id = self.unique_provider_id(&base_id);
+        let is_renamed = new_id != base_id;
+
+        if let Some(obj) = value.as_object_mut() {
+            if obj.contains_key("id") {
+                obj.insert("id".into(), Value::String(new_id.clone()));
+            }
+        }
+
+        let previous = self.doc.root().clone();
+        if !self.doc.upsert_provider(None, new_id.clone(), value) {
+            self.set_status(StatusKind::Error, "providers 字段不是对象，无法安全修改");
+            return;
+        }
+        self.record_snapshot(previous);
+        self.search.clear();
+        self.select_provider_id(&new_id);
+        if is_renamed {
+            self.set_status(
+                StatusKind::Success,
+                format!("提供商 {base_id} 已存在，已重命名为 {new_id} 并粘贴"),
+            );
+        } else {
+            self.set_status(StatusKind::Success, format!("已成功粘贴提供商 {new_id}"));
+        }
+    }
+
+    fn paste_model(&mut self, mut value: Value) {
+        let Some(provider) = self.selected_provider() else {
+            self.set_status(StatusKind::Warning, "请先选择一个提供商以粘贴模型");
+            return;
+        };
+        let provider_id = provider.summary.id.clone();
+
+        let model_id = value
+            .as_object()
+            .and_then(|obj| obj.get("id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                value
+                    .as_object()
+                    .and_then(|obj| obj.get("name"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| "model".to_owned());
+
+        let model_id = model_id.trim().to_owned();
+        let base_id = if model_id.is_empty() { "model".to_owned() } else { model_id };
+        let new_id = self.unique_model_id(&provider_id, &base_id);
+        let is_renamed = new_id != base_id;
+
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("id".into(), Value::String(new_id.clone()));
+            if is_renamed {
+                if let Some(name) = obj.get("name").and_then(Value::as_str) {
+                    let copy_name = format!("{name} Copy");
+                    obj.insert("name".into(), Value::String(copy_name));
+                }
+            }
+        }
+
+        let previous = self.doc.root().clone();
+        if let Some(index) = self.doc.push_model(&provider_id, value) {
+            self.record_snapshot(previous);
+            self.search.clear();
+            self.select_model_source_index(index);
+            if is_renamed {
+                self.set_status(
+                    StatusKind::Success,
+                    format!("模型 {base_id} 已存在，已重命名为 {new_id} 并粘贴到提供商 {provider_id}"),
+                );
+            } else {
+                self.set_status(
+                    StatusKind::Success,
+                    format!("已成功粘贴模型 {new_id} 到提供商 {provider_id}"),
+                );
+            }
+        } else {
+            self.set_status(StatusKind::Error, "提供商 models 字段不是数组");
+        }
+    }
+
     fn start_discovery(&mut self) {
         let Some(provider) = self.selected_provider() else {
             self.set_status(StatusKind::Warning, "请先选择提供商");
@@ -2679,5 +2863,34 @@ mod tests {
             app.status.text.contains("已复制搜索内容")
                 || app.status.text.contains("写入剪贴板失败")
         );
+    }
+
+    #[test]
+    fn paste_provider_and_model_from_json_and_yaml() {
+        let mut app = app();
+
+        // 测试直接粘贴 Provider（带重名处理）
+        let provider_json = serde_json::json!({
+            "baseUrl": "https://api.example.com/v1",
+            "apiKey": "test-key",
+            "models": []
+        });
+        app.paste_provider(Some("alpha".into()), provider_json);
+        // alpha 已存在，应该自动重命名为 alpha-2
+        assert!(app.doc.provider_value("alpha-2").is_some());
+        assert!(app.status.text.contains("已重命名为 alpha-2 并粘贴"));
+
+        // 测试粘贴 Model 到已选中的 Provider
+        app.select_provider_id("alpha");
+        let model_json = serde_json::json!({
+            "id": "llama",
+            "name": "Llama Model",
+            "contextWindow": 32768
+        });
+        app.paste_model(model_json);
+        // alpha 中已有 llama，应该重命名为 llama-2
+        assert!(app.status.text.contains("已重命名为 llama-2 并粘贴"));
+        let models = app.doc.models("alpha");
+        assert!(models.iter().any(|m| m.id == "llama-2"));
     }
 }
