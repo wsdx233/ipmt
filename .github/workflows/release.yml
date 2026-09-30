@@ -28,9 +28,9 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: x86_64-pc-windows-msvc
             os: windows-latest
 
@@ -38,6 +38,27 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Set binary version from release tag
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          for filename, pattern in [
+              ("Cargo.toml", r'(?m)^(version = ")[^"]+("\s*)$'),
+              ("Cargo.lock", r'(?m)^(name = "ipmt"\nversion = ")[^"]+("\s*)$'),
+          ]:
+              path = Path(filename)
+              content, count = re.subn(pattern, lambda match: match[1] + version + match[2], path.read_text(), count=1)
+              if count != 1:
+                  raise SystemExit(f"Cannot set release version in {filename}")
+              path.write_text(content)
+          print(f"Release version: {version}")
+          PY
 
       - name: Build and upload release archive
         uses: taiki-e/upload-rust-binary-action@v1

@@ -18,6 +18,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{App, ConfigChoice, ConfigPickerFocus, DialogFocus, Overlay, Pane, StatusKind};
 use crate::config::{CredentialHint, Diagnostic, Severity};
 use crate::editor::{FieldKind, FormState, PROVIDER_TEMPLATES};
+use crate::update;
 
 const BG: Color = Color::Rgb(16, 18, 20);
 const PANEL: Color = Color::Rgb(22, 24, 27);
@@ -369,6 +370,17 @@ fn overlay_mouse_action(app: &App, event: MouseEvent, terminal: Rect) -> Option<
                 }
             }
         }
+        Overlay::UpdateAvailable { .. } => {
+            let (area, _, actions) = update_dialog_layout(terminal);
+            if let MouseEventKind::Down(MouseButton::Left) = event.kind {
+                if let Some(index) = action_button_at(actions, &UPDATE_BUTTONS, point) {
+                    return Some(MouseAction::ActivateDialogButton(index));
+                }
+                if !area.contains(point) {
+                    return Some(MouseAction::Key(KeyCode::Esc, KeyModifiers::NONE));
+                }
+            }
+        }
         Overlay::Form(form) => {
             let preferred_height = (form.fields.len() as u16 + 7).clamp(15, 28);
             let area = modal_rect(terminal, 98, preferred_height, 94, 92);
@@ -572,6 +584,9 @@ fn apply_mouse_action(app: &mut App, action: MouseAction) {
                     true
                 }
                 Some(Overlay::Confirm {
+                    selected_button, ..
+                })
+                | Some(Overlay::UpdateAvailable {
                     selected_button, ..
                 }) => {
                     *selected_button = index;
@@ -1474,6 +1489,11 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App, overlay: &Overlay, terminal: R
             selected_button,
             ..
         } => draw_confirm(frame, terminal, title, message, *selected_button),
+        Overlay::UpdateAvailable {
+            version,
+            release_url,
+            selected_button,
+        } => draw_update_available(frame, terminal, version, release_url, *selected_button),
         Overlay::Form(form) => draw_form(frame, terminal, form),
         Overlay::DiscoveryLoading { provider_id } => draw_loading(frame, terminal, provider_id),
         Overlay::DiscoveryPicker {
@@ -1957,6 +1977,60 @@ fn draw_confirm(
         ],
         Some(selected_button),
     );
+}
+
+const UPDATE_BUTTONS: [ActionButton; 2] = [
+    ActionButton {
+        label: "稍后",
+        color: MUTED,
+    },
+    ActionButton {
+        label: "不再提示此版本",
+        color: CYAN,
+    },
+];
+
+fn update_dialog_layout(terminal: Rect) -> (Rect, Rect, Rect) {
+    let area = modal_rect(terminal, 82, 11, 96, 100);
+    let inner = modal_block("").inner(area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(1)])
+        .split(inner);
+    (area, rows[0], rows[1])
+}
+
+fn draw_update_available(
+    frame: &mut Frame<'_>,
+    terminal: Rect,
+    version: &str,
+    release_url: &str,
+    selected_button: usize,
+) {
+    let (area, content, actions) = update_dialog_layout(terminal);
+    frame.render_widget(Clear, area);
+    frame.render_widget(modal_block(" 发现新版本 "), area);
+    let lines = vec![
+        Line::from(format!("当前 {} → 最新 {version}", update::CURRENT_VERSION)),
+        Line::from(vec![
+            Span::raw("退出后运行 "),
+            Span::styled(
+                "ipmt update",
+                Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" 自动更新。"),
+        ]),
+        Line::from("发布说明："),
+        Line::from(Span::styled(release_url, Style::default().fg(MUTED))),
+        Line::from("忽略仅对这个版本生效，后续新版本仍会提示。"),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(TEXT).bg(PANEL)),
+        content,
+    );
+    draw_action_bar(frame, actions, &UPDATE_BUTTONS, Some(selected_button));
 }
 
 fn draw_form(frame: &mut Frame<'_>, terminal: Rect, form: &FormState) {

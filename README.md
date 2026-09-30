@@ -16,6 +16,7 @@ IPMT 是一个用 Rust、Ratatui 和 Crossterm 编写的 pi `models.json` 与 om
 - API key 默认遮罩；详情、校验和服务端错误中不会显示认证值
 - 响应式布局：宽终端三栏，中等终端双栏，窄终端单栏
 - 完整鼠标操作：点击选择、双击编辑、右键快速编辑、滚轮导航和弹窗按钮
+- 启动时后台检查 GitHub 新版本，支持按版本忽略提示；`ipmt update` 下载、校验并自动更新
 
 IPMT 编辑的是 pi 的 `models.json` 或 omp 的 `models.yml` / `models.yaml`，不会修改内置模型缓存。指定 YAML 文件时，编辑后的数据仍以 YAML 写回；YAML 注释和原始排版不会保留。
 
@@ -82,6 +83,7 @@ ipmt --file ~/.omp/agent/models.yml
 
 ```text
 ipmt [OPTIONS]
+ipmt update
 
 --file <PATH>  编辑指定 models.json、models.yml 或 models.yaml
 --check        只校验并输出脱敏摘要，不启动 TUI
@@ -90,6 +92,28 @@ ipmt [OPTIONS]
 ```
 
 当检测到文件被其他进程修改时，强制覆盖前仍会创建备份，即使使用了 `--no-backup`。
+
+## 自动更新
+
+启动 TUI 时会在后台检查 `wsdx233/ipmt` 的最新稳定 GitHub Release，不阻塞编辑；网络不可用或当前平台的发布包、校验文件尚未上传时，不会弹出提示。`--check`、`--help` 和 `--version` 不触发启动检查。
+
+发现比当前版本更新、且可用于当前平台的版本时，弹窗显示版本号、发布说明地址和更新命令：
+
+- **稍后**（或 `Esc` / `q`）：关闭本次提示，下次启动仍会检查。
+- **不再提示此版本**：只忽略弹窗中这个版本，后续新版本仍会提示。
+- 使用 `Tab` / `Shift+Tab`、左右方向键选择按钮，`Enter` / `Space` 确认；也可直接点击按钮。
+
+更新提示不会覆盖正在编辑的表单或正在输入的搜索，待关闭弹窗、结束搜索后才显示。忽略设置单独保存到用户配置目录下的 `ipmt/update.json`，不写入模型配置。Linux 默认是 `~/.config/ipmt/update.json`（遵循 `XDG_CONFIG_HOME`），macOS 是 `~/Library/Application Support/ipmt/update.json`，Windows 是 `%APPDATA%\ipmt\update.json`。
+
+退出 TUI 后运行：
+
+```bash
+ipmt update
+```
+
+该命令即使忽略过当前新版本也会检查更新，且无需载入模型配置。它会下载匹配当前平台的发布包，校验对应的 SHA-256 文件，然后替换正在运行的这份 `ipmt`；下次启动使用新版本。不会降级、重装同版本或修改模型配置。支持 Linux x86_64 GNU、macOS x86_64 / Apple Silicon 和 Windows x86_64 MSVC，前提是 Release 中已有对应发布包。安装目录不可写或下载、校验失败时会报错，不会自动提权。
+
+发布工作流会把 Git 标签版本同步到构建时的 `Cargo.toml` 和 `Cargo.lock`，确保发布包的 `--version` 与更新检查使用相同版本号。
 
 ## 常用操作
 

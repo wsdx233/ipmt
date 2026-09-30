@@ -35,6 +35,7 @@ fn set_clipboard_text(text: &str) -> bool {
 
 use crate::known_models::{KnownModel, fetch_known_models};
 use crate::model_test::{ModelTestResult, test_model};
+use crate::update;
 
 const HISTORY_LIMIT: usize = 100;
 
@@ -143,6 +144,11 @@ pub enum Overlay {
         action: ConfirmAction,
         selected_button: usize,
     },
+    UpdateAvailable {
+        version: String,
+        release_url: String,
+        selected_button: usize,
+    },
     Form(FormState),
     DiscoveryLoading {
         provider_id: String,
@@ -197,6 +203,11 @@ struct ModelTestMessage {
     result: ModelTestResult,
 }
 
+struct UpdateNotice {
+    version: String,
+    release_url: String,
+}
+
 pub struct App {
     pub doc: ConfigDocument,
     pub focus: Pane,
@@ -217,6 +228,8 @@ pub struct App {
     known_models: Option<Vec<KnownModel>>,
     known_models_pending_provider: Option<String>,
     model_test_rx: Option<Receiver<ModelTestMessage>>,
+    update_rx: Option<Receiver<Option<UpdateNotice>>>,
+    pending_update: Option<UpdateNotice>,
     last_list_click: Option<(Pane, usize, Instant)>,
 }
 
@@ -259,6 +272,8 @@ impl App {
             known_models: None,
             known_models_pending_provider: None,
             model_test_rx: None,
+            update_rx: None,
+            pending_update: None,
             last_list_click: None,
         };
         app.normalize_selection();
@@ -389,9 +404,47 @@ impl App {
         self.visible_models().get(self.model_cursor).cloned()
     }
 
+    pub fn start_update_check(&mut self) {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let notice = update::check_for_startup()
+                .ok()
+                .flatten()
+                .map(|info| UpdateNotice {
+                    version: info.version,
+                    release_url: info.release_url,
+                });
+            let _ = sender.send(notice);
+        });
+        self.update_rx = Some(receiver);
+    }
+
+    fn poll_update(&mut self) {
+        match self.update_rx.as_ref().map(Receiver::try_recv) {
+            Some(Ok(notice)) => {
+                self.update_rx = None;
+                self.pending_update = notice;
+            }
+            Some(Err(TryRecvError::Disconnected)) => self.update_rx = None,
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+        if !self.should_quit
+            && self.overlay.is_none()
+            && !self.search_active
+            && let Some(notice) = self.pending_update.take()
+        {
+            self.overlay = Some(Overlay::UpdateAvailable {
+                version: notice.version,
+                release_url: notice.release_url,
+                selected_button: 0,
+            });
+        }
+    }
+
     pub fn poll_background(&mut self) {
         self.poll_known_models();
         self.poll_model_test();
+        self.poll_update();
         let result = match self.discovery_rx.as_ref().map(Receiver::try_recv) {
             Some(Ok(result)) => Some(result),
             Some(Err(TryRecvError::Disconnected)) => {
@@ -892,6 +945,44 @@ impl App {
                         selected_button,
                     });
                 }
+            }
+            Overlay::UpdateAvailable {
+                version,
+                release_url,
+                mut selected_button,
+            } => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => return,
+                    KeyCode::Tab | KeyCode::BackTab => selected_button = (selected_button + 1) % 2,
+                    KeyCode::Left => selected_button = selected_button.saturating_sub(1),
+                    KeyCode::Right => selected_button = (selected_button + 1).min(1),
+                    KeyCode::Home => selected_button = 0,
+                    KeyCode::End => selected_button = 1,
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        if selected_button == 0 {
+                            return;
+                        }
+                        match update::ignore_version(&version) {
+                            Ok(()) => {
+                                self.set_status(
+                                    StatusKind::Success,
+                                    format!("不再提示版本 {version}；仍可运行 ipmt update"),
+                                );
+                                return;
+                            }
+                            Err(error) => self.set_status(
+                                StatusKind::Error,
+                                format!("无法保存更新设置：{error:#}"),
+                            ),
+                        }
+                    }
+                    _ => {}
+                }
+                self.overlay = Some(Overlay::UpdateAvailable {
+                    version,
+                    release_url,
+                    selected_button,
+                });
             }
             Overlay::Form(mut form) => match form.handle_key(key) {
                 FormAction::None => self.overlay = Some(Overlay::Form(form)),
@@ -2826,6 +2917,48 @@ mod tests {
             }) if output == "IPMT model test successful."
         ));
         assert_eq!(app.status.kind, StatusKind::Success);
+    }
+
+    #[test]
+    fn update_notice_waits_for_editor_and_search_then_dismisses_once() {
+        let mut app = app();
+        let original = app.doc.root().clone();
+        press(&mut app, KeyCode::Enter);
+        let (sender, receiver) = mpsc::channel();
+        app.update_rx = Some(receiver);
+        sender
+            .send(Some(UpdateNotice {
+                version: "1.2.3".into(),
+                release_url: "https://github.com/wsdx233/ipmt/releases/tag/v1.2.3".into(),
+            }))
+            .unwrap();
+        app.poll_background();
+        assert!(matches!(app.overlay, Some(Overlay::Form(_))));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('a'));
+        app.poll_background();
+        assert!(app.overlay.is_none());
+        assert!(app.search_active);
+        assert_eq!(app.search, "a");
+        press(&mut app, KeyCode::Esc);
+        app.poll_background();
+        assert!(
+            matches!(app.overlay, Some(Overlay::UpdateAvailable { ref version, .. }) if version == "1.2.3")
+        );
+        press(&mut app, KeyCode::Tab);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::UpdateAvailable {
+                selected_button: 1,
+                ..
+            })
+        ));
+        press(&mut app, KeyCode::BackTab);
+        press(&mut app, KeyCode::Enter);
+        app.poll_background();
+        assert!(app.overlay.is_none());
+        assert_eq!(app.doc.root(), &original);
     }
 
     #[test]

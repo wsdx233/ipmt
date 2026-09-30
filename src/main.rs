@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -20,7 +20,7 @@ use ipmt::config::{
     ConfigDocument, Severity, configured_agent_directory, configured_omp_agent_directory,
     existing_model_path, existing_yaml_path,
 };
-use ipmt::ui;
+use ipmt::{ui, update};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -28,9 +28,13 @@ use ratatui::backend::CrosstermBackend;
 #[command(
     name = "ipmt",
     version,
+    args_conflicts_with_subcommands = true,
     about = "Edit pi providers and models in a terminal UI"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Edit a specific models.json, models.yml, or models.yaml file.
     #[arg(long, value_name = "PATH")]
     file: Option<PathBuf>,
@@ -48,6 +52,12 @@ struct Cli {
     no_backup: bool,
 }
 
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Download, verify, and install the latest stable GitHub release.
+    Update,
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
@@ -60,6 +70,9 @@ fn main() -> ExitCode {
 
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
+    if matches!(cli.command, Some(Command::Update)) {
+        return update_command();
+    }
     let path = config_path(cli.file.as_deref())?;
     let doc =
         ConfigDocument::load(&path).with_context(|| format!("无法载入 {}", path.display()))?;
@@ -69,7 +82,21 @@ fn run() -> Result<ExitCode> {
     }
 
     let mut app = App::new(doc, cli.read_only, !cli.no_backup);
+    app.start_update_check();
     run_tui(&mut app)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn update_command() -> Result<ExitCode> {
+    println!("正在检查 GitHub 最新版本…");
+    let Some(info) = update::check_for_update()? else {
+        println!("当前版本 {}，暂无可用更新", update::CURRENT_VERSION);
+        return Ok(ExitCode::SUCCESS);
+    };
+    println!("发现新版本：{} → {}", update::CURRENT_VERSION, info.version);
+    println!("正在下载并校验 SHA-256…");
+    update::install_update(&info)?;
+    println!("已更新至 {}；下次启动生效", info.version);
     Ok(ExitCode::SUCCESS)
 }
 
