@@ -2610,23 +2610,34 @@ mod tests {
         ));
     }
     #[test]
-    fn s_saves_omp_configuration() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("models.yml");
-        std::fs::write(&path, "providers: {}\n").unwrap();
-        let mut app = App::new(ConfigDocument::load(&path).unwrap(), false, false);
-        app.doc.replace_root(json!({
-            "providers": {
-                "saved": {"models": []}
-            }
-        }));
+    fn s_saves_omp_configuration_with_known_and_future_api_types() {
+        for api in ["typesafe", "future-api"] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("models.yml");
+            std::fs::write(&path, "providers: {}\n").unwrap();
+            let mut app = App::new(ConfigDocument::load(&path).unwrap(), false, false);
+            let edited = json!({
+                "providers": {
+                    "saved": {
+                        "baseUrl": "https://gateway.example/v1",
+                        "api": api,
+                        "models": [{
+                            "id": "model-a",
+                            "api": api,
+                            "futureModel": {"kind": "judge"}
+                        }]
+                    }
+                }
+            });
+            app.doc.replace_root(edited.clone());
 
-        press(&mut app, KeyCode::Char('s'));
+            press(&mut app, KeyCode::Char('s'));
 
-        let saved = ConfigDocument::load(&path).unwrap();
-        assert_eq!(saved.root()["providers"]["saved"]["models"], json!([]));
-        assert!(!app.is_dirty());
-        assert_eq!(app.status.kind, StatusKind::Success);
+            let saved = ConfigDocument::load(&path).unwrap();
+            assert_eq!(saved.root(), &edited, "{api}");
+            assert!(!app.is_dirty());
+            assert_eq!(app.status.kind, StatusKind::Success);
+        }
     }
 
     #[test]

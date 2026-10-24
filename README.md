@@ -183,7 +183,11 @@ cargo test --all-targets
 cargo run -- --check
 ```
 
-项目校验 pi `models.json` 与 omp `models.yml` / `models.yaml` 通用的模型字段，并接受 pi 与 omp 当前支持的 API 类型：`openai-completions`、`openai-responses`、`openai-codex-responses`、`azure-openai-responses`、`anthropic-messages`、`bedrock-converse-stream`、`google-generative-ai`、`google-gemini-cli` 和 `google-vertex`。OMP 专属的未知字段会在普通表单编辑和保存时保留。
+项目校验 pi `models.json` 与 omp `models.yml` / `models.yaml` 通用的模型字段。已知 API 选项包括 `openai-completions`、`openai-responses`、`openai-codex-responses`、`azure-openai-responses`、`anthropic-messages`、`bedrock-converse-stream`、`google-generative-ai`、`google-gemini-cli`、`google-vertex` 和 `typesafe`。
+
+对于 omp YAML 配置，提供商和模型上的未知、非空 API 名称只产生警告，不会阻止保存，由 omp 在运行时判断是否支持。pi JSON 配置中的未知 API 名称仍视为错误。所有格式中的非字符串或空白 API 值都会报错；留空继承时应省略该字段。OMP 专属的未知字段会在普通表单编辑和保存时保留。
+
+`typesafe` 是 omp 的判定（judge）API。支持编辑和保存其配置不代表支持普通聊天请求；现有 `t` 连通性测试仍发送普通聊天提示，不是 judge API 专用测试。
 
 ## 致谢
 

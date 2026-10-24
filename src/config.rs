@@ -23,6 +23,7 @@ pub const SUPPORTED_APIS: &[&str] = &[
     "google-generative-ai",
     "google-gemini-cli",
     "google-vertex",
+    "typesafe",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -479,6 +480,7 @@ impl ConfigDocument {
             validate_api(
                 provider.get("api"),
                 &format!("{path}.api"),
+                self.format,
                 &mut diagnostics,
             );
             validate_url(
@@ -550,6 +552,7 @@ impl ConfigDocument {
                 validate_model(
                     model_value,
                     &format!("{path}.models[{index}]"),
+                    self.format,
                     &mut ids,
                     &mut diagnostics,
                 );
@@ -728,6 +731,7 @@ fn exact_environment_name(value: &str) -> Option<String> {
 fn validate_model(
     value: &Value,
     path: &str,
+    format: ConfigFormat,
     ids: &mut HashSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -748,7 +752,12 @@ fn validate_model(
     }
     validate_optional_string(model, "name", path, diagnostics);
     validate_optional_bool(model, "reasoning", path, diagnostics);
-    validate_api(model.get("api"), &format!("{path}.api"), diagnostics);
+    validate_api(
+        model.get("api"),
+        &format!("{path}.api"),
+        format,
+        diagnostics,
+    );
     validate_positive_integer(
         model.get("contextWindow"),
         &format!("{path}.contextWindow"),
@@ -884,7 +893,12 @@ fn validate_optional_bool(
     }
 }
 
-fn validate_api(value: Option<&Value>, path: &str, diagnostics: &mut Vec<Diagnostic>) {
+fn validate_api(
+    value: Option<&Value>,
+    path: &str,
+    format: ConfigFormat,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     let Some(value) = value else {
         return;
     };
@@ -892,11 +906,20 @@ fn validate_api(value: Option<&Value>, path: &str, diagnostics: &mut Vec<Diagnos
         diagnostics.push(Diagnostic::error(path, "api must be a string"));
         return;
     };
+    if api.trim().is_empty() {
+        diagnostics.push(Diagnostic::error(path, "api cannot be empty"));
+        return;
+    }
     if !SUPPORTED_APIS.contains(&api) {
-        diagnostics.push(Diagnostic::error(
-            path,
-            format!("unsupported model API type: {api}"),
-        ));
+        diagnostics.push(match format {
+            ConfigFormat::Json => {
+                Diagnostic::error(path, format!("unsupported model API type: {api}"))
+            }
+            ConfigFormat::Yaml => Diagnostic::warning(
+                path,
+                format!("unrecognized model API type: {api}; preserved for omp to validate"),
+            ),
+        });
     }
 }
 
@@ -1331,6 +1354,57 @@ mod tests {
             item.path == "$.providers.test.models[0].cost.cacheWrite"
                 && item.severity == Severity::Error
         }));
+    }
+
+    #[test]
+    fn api_validation_keeps_omp_extensions_non_blocking_and_rejects_invalid_values() {
+        let dir = tempdir().unwrap();
+        for (filename, unknown_severity) in [
+            ("models.json", Severity::Error),
+            ("models.yml", Severity::Warning),
+            ("models.yaml", Severity::Warning),
+        ] {
+            for (api, expected_severity) in [
+                (json!("openai-responses"), None),
+                (json!("typesafe"), None),
+                (json!("future-api"), Some(unknown_severity)),
+                (json!(""), Some(Severity::Error)),
+                (json!(" \t\n"), Some(Severity::Error)),
+                (json!(42), Some(Severity::Error)),
+                (json!(false), Some(Severity::Error)),
+                (Value::Null, Some(Severity::Error)),
+                (json!(["typesafe"]), Some(Severity::Error)),
+                (json!({"type": "typesafe"}), Some(Severity::Error)),
+            ] {
+                let doc = ConfigDocument::from_value(
+                    dir.path().join(filename),
+                    json!({
+                        "providers": {
+                            "gateway": {
+                                "baseUrl": "https://gateway.example/v1",
+                                "api": api,
+                                "models": [{"id": "model-a", "api": api}]
+                            }
+                        }
+                    }),
+                );
+                let diagnostics: std::collections::BTreeMap<_, _> = doc
+                    .validate()
+                    .into_iter()
+                    .map(|item| (item.path, item.severity))
+                    .collect();
+                let expected: std::collections::BTreeMap<_, _> = expected_severity
+                    .into_iter()
+                    .flat_map(|severity| {
+                        [
+                            ("$.providers.gateway.api".to_owned(), severity),
+                            ("$.providers.gateway.models[0].api".to_owned(), severity),
+                        ]
+                    })
+                    .collect();
+                assert_eq!(diagnostics, expected, "{filename}: {api}");
+            }
+        }
     }
 
     #[test]
