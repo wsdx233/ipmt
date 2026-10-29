@@ -482,18 +482,18 @@ impl FormState {
             }
             match event.code {
                 KeyCode::Char('c') => {
-                    if self.current().is_editable_text() {
-                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                            let _ = clipboard.set_text(self.current().value.clone());
-                        }
+                    if self.current().is_editable_text()
+                        && let Ok(mut clipboard) = arboard::Clipboard::new()
+                    {
+                        let _ = clipboard.set_text(self.current().value.clone());
                     }
                     return FormAction::None;
                 }
                 KeyCode::Char('v') => {
-                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                        if let Ok(text) = clipboard.get_text() {
-                            self.insert_paste(&text);
-                        }
+                    if let Ok(mut clipboard) = arboard::Clipboard::new()
+                        && let Ok(text) = clipboard.get_text()
+                    {
+                        self.insert_paste(&text);
                     }
                     return FormAction::None;
                 }

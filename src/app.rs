@@ -11,8 +11,8 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use serde_json::{Value, json};
 
 use crate::config::{
-    ConfigDocument, ConfigError, ConfigFormat, Diagnostic, ModelSummary, ProviderSummary,
-    Severity, configured_agent_directory, configured_omp_agent_directory, existing_model_path,
+    ConfigDocument, ConfigError, ConfigFormat, Diagnostic, ModelSummary, ProviderSummary, Severity,
+    configured_agent_directory, configured_omp_agent_directory, existing_model_path,
     existing_yaml_path,
 };
 use crate::discovery::{DiscoveredModel, DiscoveryRequest, discover_models};
@@ -608,7 +608,6 @@ impl App {
             self.normalize_selection();
         }
     }
-
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::ALT) {
@@ -1915,8 +1914,9 @@ impl App {
                 else {
                     return;
                 };
-                let Some(value) =
-                    self.doc.model_value(&provider.summary.id, model.source_index)
+                let Some(value) = self
+                    .doc
+                    .model_value(&provider.summary.id, model.source_index)
                 else {
                     return;
                 };
@@ -2040,14 +2040,18 @@ impl App {
             .unwrap_or_else(|| "provider".to_owned());
 
         let id = id.trim().to_owned();
-        let base_id = if id.is_empty() { "provider".to_owned() } else { id };
+        let base_id = if id.is_empty() {
+            "provider".to_owned()
+        } else {
+            id
+        };
         let new_id = self.unique_provider_id(&base_id);
         let is_renamed = new_id != base_id;
 
-        if let Some(obj) = value.as_object_mut() {
-            if obj.contains_key("id") {
-                obj.insert("id".into(), Value::String(new_id.clone()));
-            }
+        if let Some(obj) = value.as_object_mut()
+            && obj.contains_key("id")
+        {
+            obj.insert("id".into(), Value::String(new_id.clone()));
         }
 
         let previous = self.doc.root().clone();
@@ -2090,17 +2094,19 @@ impl App {
             .unwrap_or_else(|| "model".to_owned());
 
         let model_id = model_id.trim().to_owned();
-        let base_id = if model_id.is_empty() { "model".to_owned() } else { model_id };
+        let base_id = if model_id.is_empty() {
+            "model".to_owned()
+        } else {
+            model_id
+        };
         let new_id = self.unique_model_id(&provider_id, &base_id);
         let is_renamed = new_id != base_id;
 
         if let Some(obj) = value.as_object_mut() {
             obj.insert("id".into(), Value::String(new_id.clone()));
-            if is_renamed {
-                if let Some(name) = obj.get("name").and_then(Value::as_str) {
-                    let copy_name = format!("{name} Copy");
-                    obj.insert("name".into(), Value::String(copy_name));
-                }
+            if is_renamed && let Some(name) = obj.get("name").and_then(Value::as_str) {
+                let copy_name = format!("{name} Copy");
+                obj.insert("name".into(), Value::String(copy_name));
             }
         }
 
@@ -2112,7 +2118,9 @@ impl App {
             if is_renamed {
                 self.set_status(
                     StatusKind::Success,
-                    format!("模型 {base_id} 已存在，已重命名为 {new_id} 并粘贴到提供商 {provider_id}"),
+                    format!(
+                        "模型 {base_id} 已存在，已重命名为 {new_id} 并粘贴到提供商 {provider_id}"
+                    ),
                 );
             } else {
                 self.set_status(
@@ -2983,17 +2991,21 @@ mod tests {
     fn alt_c_copies_selected_provider_and_model_code() {
         let mut app = app();
         app.focus = Pane::Providers;
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT)));
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::ALT,
+        )));
         assert!(
-            app.status.text.contains("已复制提供商")
-                || app.status.text.contains("写入剪贴板失败")
+            app.status.text.contains("已复制提供商") || app.status.text.contains("写入剪贴板失败")
         );
 
         app.focus = Pane::Models;
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT)));
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::ALT,
+        )));
         assert!(
-            app.status.text.contains("已复制模型")
-                || app.status.text.contains("写入剪贴板失败")
+            app.status.text.contains("已复制模型") || app.status.text.contains("写入剪贴板失败")
         );
     }
 
@@ -3002,7 +3014,10 @@ mod tests {
         let mut app = app();
         app.search_active = true;
         app.search = "test-query".into();
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT)));
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::ALT,
+        )));
         assert!(
             app.status.text.contains("已复制搜索内容")
                 || app.status.text.contains("写入剪贴板失败")
